@@ -780,7 +780,8 @@ Draft worker：**不要** publish，以免覆盖 target 的 bags；draft 用自�
 | HTTP 路由 | `http_server.py`；协议适配 `entrypoints/openai/` |
 | IPC 字段 | `io_struct.py`（两端一起改 + encode hook） |
 | Tokenize / 流式回包 | `tokenizer_manager.py` |
-| 调度策略 / continuous batching | `schedule_policy.py` `PrefillAdder`、`get_next_batch_to_run` |
+| 调度策略 / continuous batching | `schedule_policy.py` `PrefillAdder`、`get_next_batch_to_run`（详见 [服务扩展精读 §9](/docs/developer_guide/code_reading_serving_extensions_zh#9-continuous-batching--schedule-policy-内部)） |
+| OpenAI/Anthropic / Grammar / VLM / Session | [服务扩展模块精读](/docs/developer_guide/code_reading_serving_extensions_zh) |
 | Overlap / stream 同步 | `event_loop_overlap`、`future_map`、`overlap_utils.py` |
 | 结果处理 / 输出频率 | `scheduler_components/batch_result_processor.py`、`output_streamer.py` |
 | Forward / graph / sample | `model_runner.py` 编排 + 其 collaborator；`tp_worker.py` |

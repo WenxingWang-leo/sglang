@@ -1,0 +1,612 @@
+---
+title: "SGLang 服务扩展模块精读（API / Grammar / VLM / Session / Observability）"
+description: "实现级中文精读：OpenAI/Anthropic HTTP、结构化输出、Tool Calling、多模态 VLM、Session、可观测性、权重热更新、CUDA Graph/torch.compile、连续批调度策略、硬件后端插件。"
+keywords:
+  - sglang
+  - openai api
+  - structured output
+  - function calling
+  - multimodal
+  - session
+  - cuda graph
+  - schedule policy
+  - hardware backend
+  - code reading
+---
+
+本篇补齐 [SRT 核心服务路径](/docs/developer_guide/code_reading_srt_core_zh) 与 [进阶模块](/docs/developer_guide/code_reading_notes_advanced_zh) 较少展开的十个子系统。路径相对仓库根；符号以当前代码为准。
+
+配套：[部署与开发总览](/docs/developer_guide/code_reading_notes_zh)、[Mem Cache / Models / Layers / Sampling](/docs/developer_guide/code_reading_deep_dive_zh)。
+
+## 总览：扩展点如何挂到主路径
+
+```text
+HTTP Client
+  ├─ /v1/chat/completions     → OpenAIServingChat
+  ├─ /v1/messages             → AnthropicServing → OpenAIServingChat
+  ├─ /generate                → GenerateReqInput（原生）
+  └─ /update_weights_*        → TokenizerManager → SchedulerWeightUpdater
+        │
+        ▼
+OpenAIServingBase.handle_request
+  → _convert_to_internal_request → GenerateReqInput
+  → TokenizerManager.generate_request
+       ├─ tokenize + (可选) mm_processor.process_mm_data_async
+       ├─ SamplingParams(json_schema|regex|ebnf|structural_tag)
+       └─ ZMQ → Scheduler
+              ├─ GrammarManager 异步编译 → waiting_queue
+              ├─ SessionController / StreamingSession（多轮）
+              ├─ SchedulePolicy.calc_priority + PrefillAdder.add_one_req
+              └─ TpModelWorker → ModelRunner
+                    ├─ Prefill/Decode CudaGraphRunner / EagerRunner
+                    ├─ SamplingBatchInfo.update_regex_vocab_mask → logits mask
+                    └─ (VLM) general_mm_embed_routine 嵌入图像特征
+```
+
+---
+
+## 1. OpenAI / Anthropic HTTP 服务层
+
+### 1.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/entrypoints/http_server.py` | FastAPI：挂载 serving handler、`/v1/chat/completions`、`/v1/messages`、权重 RPC |
+| `srt/entrypoints/openai/protocol.py` | Pydantic 请求/响应；`ChatCompletionRequest.to_sampling_params` |
+| `srt/entrypoints/openai/serving_base.py` | `OpenAIServingBase`：校验 → 转换 → 流式/非流式 |
+| `srt/entrypoints/openai/serving_chat.py` | `OpenAIServingChat`：消息编码、工具约束、流式 tool/reasoning |
+| `srt/entrypoints/openai/serving_completions.py` 等 | completion / embedding / classify / rerank / score / tokenize / transcription |
+| `srt/entrypoints/openai/serving_responses.py` | OpenAI Responses API（继承 Chat） |
+| `srt/entrypoints/anthropic/protocol.py` | Anthropic Messages 协议块（text/image/tool_use/thinking…） |
+| `srt/entrypoints/anthropic/serving.py` | `AnthropicServing`：Anthropic → ChatCompletionRequest 适配 |
+
+`lifespan` 里构造：
+
+```text
+openai_serving_chat = tokenizer_manager.serving_chat_class(tokenizer_manager, template_manager)
+anthropic_serving = AnthropicServing(openai_serving_chat)
+```
+
+### 1.2 主类与方法
+
+**`OpenAIServingBase.handle_request`**
+
+1. `_validate_request`
+2. `_convert_to_internal_request` → `(GenerateReqInput, processed_request)`
+3. 按 `stream` 调 `_handle_streaming_request` / `_handle_non_streaming_request`
+4. 最终都走 `tokenizer_manager.generate_request(adapted_request, …)`
+
+**`OpenAIServingChat._convert_to_internal_request`（核心变换）**
+
+1. `_process_messages`：chat template + tools → `MessageProcessingResult`
+2. `request.to_sampling_params(stop=…, tool_call_constraint=…)`
+3. 组 `prompt_kwargs`：纯文本用 `input_ids`；多数 VLM 用 `text`（含占位符）；`kimi_k3` / Inkling 可直接传预编码 `input_ids`
+4. 构造 `GenerateReqInput(image_data/video_data/audio_data/sampling_params/…)`
+
+**`ChatCompletionRequest.to_sampling_params`**
+
+- `response_format.type == json_schema` → `sampling_params["json_schema"]`（字符串）
+- `json_object` → `'{"type": "object"}'`
+- `structural_tag` → `sampling_params["structural_tag"]`
+- 若有 `tool_call_constraint` 且尚未有其它约束 → 写入 `structural_tag` 或 `json_schema`
+- 与已有 grammar 冲突时跳过 tool constraint（chat）或报错（responses）
+
+### 1.3 Anthropic 适配算法
+
+`AnthropicServing` **不直接** 建 `GenerateReqInput`：
+
+```text
+AnthropicMessagesRequest
+  → _convert_to_chat_completion_request
+       ├─ system → system message
+       ├─ content blocks → OpenAI message parts（image source → image_url）
+       ├─ tool_use / tool_result → assistant/tool messages
+       ├─ thinking → reasoning 相关字段
+       └─ tools / tool_choice / thinking budget → ChatCompletionRequest 字段
+  → openai_serving_chat._convert_to_internal_request
+  → 流式时把 OpenAI SSE 再映射为 Anthropic content_block_delta 事件
+```
+
+流式关键：`_generate_anthropic_stream` 维护 `message_start` / `content_block_start|delta|stop` / `message_delta|stop` 状态机。
+
+### 1.4 算法/数据流（请求变换）
+
+```text
+ChatCompletionRequest
+  → _encode_messages / apply_chat_template / conversation template
+  → (tools?) FunctionCallParser.get_structure_constraint → ToolCallConstraint
+  → to_sampling_params → dict
+  → GenerateReqInput
+  → TokenizerManager._tokenize_one_request
+       → TokenizedGenerateReqInput (+ mm_inputs)
+  → Scheduler.handle_generate_request → Req
+```
+
+---
+
+## 2. 结构化输出 / Grammar / Constrained Decoding
+
+### 2.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/constrained/base_grammar_backend.py` | `BaseGrammarObject` / `BaseGrammarBackend` / `create_grammar_backend` |
+| `srt/constrained/grammar_manager.py` | Scheduler 侧异步编译队列与 TP/PP 同步 |
+| `srt/constrained/xgrammar_backend.py` | 默认后端（bitmask） |
+| `srt/constrained/llguidance_backend.py` | llguidance |
+| `srt/constrained/outlines_backend.py` + `outlines_jump_forward.py` | Outlines + jump-forward |
+| `srt/constrained/reasoner_grammar_backend.py` | 推理结束后再施加 grammar |
+| `srt/sampling/sampling_params.py` | `json_schema` / `regex` / `ebnf` / `structural_tag` 字段 |
+| `srt/sampling/sampling_batch_info.py` | `update_regex_vocab_mask` / `grammar_mask.apply` |
+
+### 2.2 后端工厂
+
+`create_grammar_backend(server_args, tokenizer, vocab_size, eos, think_end_ids)`：
+
+- `--grammar-backend`：`xgrammar`（默认）/ `llguidance` / `outlines` / `none`
+- 自定义：`register_grammar_backend(name, init_func)` → `GRAMMAR_BACKEND_REGISTRY`
+- 若配置了 `--reasoning-parser` 且有 `think_end_ids` → 外包 `ReasonerGrammarBackend`
+
+**`BaseGrammarObject` 契约：**
+
+- `accept_token` / `rollback` / `is_terminated`
+- `allocate_vocab_mask` / `fill_vocab_mask` / `fill_vocab_mask_batched`
+- `apply_vocab_mask(logits, vocab_mask)`
+- 可选 `try_jump_forward` / `jump_forward_str_state`（Outlines jump-forward）
+
+### 2.3 挂到 serving 路径
+
+1. HTTP → `SamplingParams.json_schema|regex|ebnf|structural_tag`
+2. Scheduler 收 `TokenizedGenerateReqInput` 建 `Req` 时：`GrammarManager.process_req_with_grammar(req)`
+3. cache miss → `grammar_backend.get_cached_or_future_value(key)` → `grammar_queue`
+4. 每轮 prefill 前：`get_ready_grammar_requests()`（PP0 轮询 Future；DP/TP `all_gather` 取交集；再 PP 链式同步）→ `_add_request_to_queue`
+5. Decode：`SamplingBatchInfo.update_regex_vocab_mask` → `grammar_mask.apply(logits)`
+6. 接受 token 后：`batch_result_processor.advance_grammar_fsm` / `_accept_grammar_tokens`
+
+### 2.4 重要算法
+
+**A. Grammar 编译与就绪同步**
+
+- key = `("json"|"regex"|"ebnf"|"structural_tag", payload_str)`
+- hit：直接 `req.grammar = cached.copy()`；invalid → abort
+- miss：Future 入队；超时 `SGLANG_GRAMMAR_MAX_POLL_ITERATIONS` → abort 并缓存 `InvalidGrammarObject`
+
+**B. ReasonerGrammar（thinking 延迟约束）**
+
+`ReasonerGrammarObject`：在 `think_end_ids` 序列匹配完成前 **不** 把底层 grammar 接到 logits；匹配后 `tokens_after_end` 递增并开始 `fill_vocab_mask`。支持 `max_think_tokens`（来自 `custom_params.thinking_budget`）与可选 token filter（`--enable-strict-thinking`）。
+
+**C. 批内 mask 填充**
+
+```text
+first_grammar.allocate_vocab_mask(vocab_size, batch_size, device)
+→ fill_vocab_mask_batched([GrammarRow(row, grammar), …])  # 跳过 finished
+→ move_vocab_mask → GrammarMask.apply(logits)
+```
+
+---
+
+## 3. Function Calling / Tool Parsers
+
+### 3.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/function_call/function_call_parser.py` | `FunctionCallParser` 门面 + detector 注册表 |
+| `srt/function_call/base_format_detector.py` | 流式/非流式解析基类 + structural_tag 钩子 |
+| `srt/function_call/*_detector.py` | 各模型格式（Hermes、Qwen、DeepSeek、Kimi、GLM…） |
+| `srt/function_call/utils.py` | `get_json_schema_constraint`、schema 规范化 |
+| `srt/parser/reasoning_parser.py` | 与 tool 并列的 reasoning 文本分离 |
+| `srt/parser/template_manager.py` | 建议 `tool_call_parser` / `reasoning_parser` |
+| `srt/entrypoints/http_server.py` | `POST /parse_function_call` 独立解析端点 |
+
+### 3.2 主类
+
+**`FunctionCallParser.ToolCallParserEnum`**：字符串 → Detector 类（`qwen`/`hermes`/`llama3`/`deepseekv3*`/`kimi_k2`/`kimi_k3`/`glm47`/`gpt-oss`/`inkling`…）。
+
+方法：
+
+- `parse_non_stream` / `parse_stream_chunk` → `(normal_text, List[ToolCallItem])`
+- `get_structure_constraint(tool_choice, parallel_tool_calls, thinking_mode)` → `ToolCallConstraint`
+- `get_legacy_structural_tag(at_least_one)` → 旧版 triggers/structures
+
+**`BaseFormatDetector` 流式状态：** `_buffer`、`prev_tool_call_arr`、`current_tool_id`、`current_tool_name_sent`、`streamed_args_for_tool`；默认增量路径用 `partial_json_loads`。
+
+### 3.3 挂到路径
+
+**请求侧（约束）：** `OpenAIServingChat._process_messages` → 若有 tools 且 `tool_choice != none` → `get_structure_constraint` → 写入 sampling_params → Grammar 路径。
+
+优先级（`get_structure_constraint`）：
+
+1. 模型原生 `get_auto_tool_call_structural_tag` / `get_structural_tag`（xgrammar StructuralTag）
+2. `supports_structural_tag()` → legacy structural_tag
+3. `required` 且非 native → `get_json_schema_constraint`（JSON array of tool calls）
+
+**响应侧（解析）：**
+
+- 非流式：`_process_tool_calls` → `parse_non_stream`
+- 流式：`_process_tool_call_stream` → `parse_stream_chunk`，增量发 `tool_calls[].function.arguments` delta
+
+`SGLANG_TOOL_STRICT_LEVEL` 控制 schema 严格程度（FUNCTION / PARAMETER）。
+
+### 3.4 算法要点
+
+1. **约束 + 解析双轨**：grammar 保证格式合法；detector 把文本切成 OpenAI `tool_calls`。
+2. **streaming 缓冲**：半截 bot_token / 半截 JSON 留在 `_buffer`，避免误把中间内容当 normal_text。
+3. **reasoning 协作**：`--reasoning-parser` 存在时，structural_tag 的 `thinking_mode` 常设为 False，由 `ReasonerGrammarBackend` 管 think 前缀。
+
+---
+
+## 4. 多模态 VLM 路径
+
+### 4.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/managers/multimodal_processor.py` | `PROCESSOR_MAPPING` / `import_processors` / `get_mm_processor` |
+| `srt/multimodal/processors/base_processor.py` | `BaseMultimodalProcessor`：加载、tokenize、展开 placeholder |
+| `srt/multimodal/processors/*.py` | 各模型 processor（`models = [Arch, …]`） |
+| `srt/managers/mm_utils.py` | padding pattern、`general_mm_embed_routine`、SHM 传输 |
+| `srt/managers/tokenizer_manager.py` | tokenize 路径调用 `process_mm_data_async` |
+| `srt/multimodal/vit_cuda_graph_runner.py` | ViT 侧 CUDA graph（可选） |
+
+### 4.2 Processor 插件注册
+
+```text
+import_processors("sglang.srt.multimodal.processors")
+  → 扫描模块中 BaseMultimodalProcessor 子类
+  → PROCESSOR_MAPPING[arch] = ProcessorCls
+
+get_mm_processor(hf_config, …)
+  → 按 hf_config.architectures 匹配
+  → transformers backend 可回退 TransformersAutoMultimodalProcessor
+```
+
+### 4.3 Tokenizer → Scheduler 数据流
+
+```text
+GenerateReqInput(image_data / video_data / audio_data [, text|input_ids])
+  → TokenizerManager
+       ├─ 可选：空 text + 仅音频（Whisper）先 placeholder
+       ├─ mm_processor.process_mm_data_async(...)
+       │     ├─ 并行加载媒体
+       │     ├─ HF processor / 自定义 preprocess → pixel tensors
+       │     ├─ 展开 image/video/audio special tokens → 最终 input_ids
+       │     └─ MultimodalInputs(mm_items: MultimodalDataItem[])
+       │           每项：feature、offsets、pad_value(=hash)、modality
+       └─ TokenizedGenerateReqInput(mm_inputs=…)
+  → Scheduler：pad_input_ids（用 pad_value 替换占位区间，供 radix/prefix）
+  → Model forward：general_mm_embed_routine
+       ├─ 按 pad_value / offsets 找位置
+       ├─ get_image_feature / encoder（或 EPD 收远端 embedding）
+       └─ scatter 到 inputs_embeds
+```
+
+**EPD / language_only：** `encoder_transfer_backend` 为 `zmq_to_tokenizer` / `zmq_to_scheduler` / `mooncake` 时，Tokenizer 可先 `mm_receiver.recv_mm_data`，失败再本地 process。
+
+**外部路由哈希：** `mm_hashes` 预置 `MultimodalDataItem.hash`，使 prefix-cache key 与路由器一致。
+
+### 4.4 Padding 两种模式（`mm_utils`）
+
+- `MultiModalityDataPaddingPatternTokenPairs`：成对 start/end token 之间整段换成同一 `pad_value`
+- `MultiModalityDataPaddingPatternMultimodalTokens`：按 offsets 区间写 `pad_value`
+
+Radix 把这些 pad_value 当「伪 token」参与前缀匹配，从而跨请求复用同图 KV。
+
+---
+
+## 5. Session API
+
+### 5.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/session/session_controller.py` | `Session` / `SessionController` / `SessionReqNode` |
+| `srt/session/streaming_session.py` | `StreamingSession`：包装 `BasePrefixCache`，持有跨轮 KV |
+| `srt/managers/io_struct.py` | `SessionParams`、`OpenSessionReqInput/Output`、`CloseSessionReqInput` |
+| `srt/managers/scheduler.py` | `open_session` / `close_session`；`handle_generate_request` 里 `session.create_req` |
+
+### 5.2 两类 session 概念
+
+| 字段 | 含义 |
+|---|---|
+| `GenerateReqInput.session_id` | 稳定会话身份，**不**改写 prompt |
+| `GenerateReqInput.session_params` | 多轮拼接：`id` / `rid` / `offset` / `replace` / `drop_previous_output` |
+
+二者互斥（`normalize` 校验）。
+
+### 5.3 `SessionController` 流程
+
+```text
+OpenSessionReqInput(capacity_of_str_len, streaming?, timeout?)
+  → SessionController.open → Session(session_id, streaming, …)
+
+TokenizedGenerateReqInput(session_params=SessionParams(id=…))
+  → Session.create_req
+       ├─ streaming：只允许简单 append；单 inflight；_share_token_arrays 原地扩展
+       ├─ replace：abort 指定/全部节点后插入
+       └─ 普通：挂到 rid 父节点，拼接 origin+output+new_input
+  → Req（带 session 回链）
+  → finish_req：更新 committed_* 长度；streaming 更新唯一 req_node
+```
+
+**StreamingSession（radix 包装）：** `try_match_prefix` / `try_cache_finished_req` 优先走 `SessionSlot` 持有的 KV，避免每轮重新 radix 匹配整段历史；`release_session` 释放 slot。
+
+超时：`maybe_reap` 周期性清 idle session。
+
+### 5.4 算法要点
+
+1. **非流式 session 树**：`SessionReqNode` 父子关系支持 branch/replace。
+2. **流式零拷贝**：`committed_origin_len` 等记录上次成功终点；abort 后 trim 再 extend，避免脏 token 残留。
+3. **多模态偏移**：`_strip_bos_token` 与 `adjust_mm_offsets` 在拼接后修正 `mm_item.offsets`。
+
+---
+
+## 6. Observability：Metrics / Tracing / Logging
+
+### 6.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/observability/metrics_collector.py` | Prometheus：Scheduler / Tokenizer / Storage / Radix / Encoder |
+| `srt/observability/trace.py` | OTLP：`TraceReqContext` slice/event |
+| `srt/observability/req_time_stats.py` | 请求阶段时间戳 |
+| `srt/observability/forward_pass_metrics.py` | 单次 forward 指标 |
+| `srt/observability/request_metrics_exporter.py` | 请求级导出 |
+| `srt/managers/scheduler_components/metrics_reporter.py` | Scheduler 周期上报 |
+| `srt/managers/configure_logging.py` | CLI：`POST /configure_logging` 动态改 log/dump |
+
+### 6.2 Metrics 主类
+
+- `SchedulerMetricsCollector`：`log_stats(SchedulerStats)` —— queue 长度、token 用量、cache hit、cuda graph pass、grammar queue、retract、KV transfer…
+- `TokenizerMetricsCollector`：TTFT、ITL、finished/aborted、cache source
+- `EncoderMetricsCollector`：VLM preprocess / ViT forward / transfer
+- `RadixCacheMetricsCollector`：evict / load_back
+
+`SchedulerStats` 由 `metrics_reporter` 每 N 步从 waiting/running/grammar 队列采样。
+
+### 6.3 Tracing 数据流
+
+```text
+process_tracing_init(otlp_endpoint)
+  → HTTP 头 extract_trace_headers → GenerateReqInput.external_trace_header
+  → TraceReqContext.trace_req_start
+       → trace_slice_start/end("tokenize" | "prefill" | "decode" | …)
+  → 跨进程：TraceReqContext.__getstate__/__setstate__ 随 ZMQ 消息传递
+```
+
+`TraceNullContext`：未开启时所有方法 no-op。
+
+### 6.4 动态日志
+
+`python -m sglang.srt.managers.configure_logging --url … --log-requests --log-requests-level 3` → 改 `request_logger` 与 dump 目录，无需重启。
+
+---
+
+## 7. Weight Update / RL / Checkpoint Engine
+
+### 7.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/entrypoints/http_server.py` | `/update_weights_from_disk|tensor|distributed|ipc`、`/init_weights_update_group` |
+| `srt/managers/scheduler_components/weight_updater.py` | `SchedulerWeightUpdaterManager`：RPC 分发 + flush cache |
+| `srt/model_executor/model_runner_components/weight_updater.py` | `WeightUpdater`：实际写参 |
+| `srt/checkpoint_engine/checkpoint_engine_worker.py` | IPC 扩展：`SGLangCheckpointEngineWorkerExtensionImpl` |
+| `srt/checkpoint_engine/update.py` | torchrun 侧 ParameterServer 推权重脚本 |
+| `srt/weight_sync/utils.py` | Engine API 侧 bucket 张量更新辅助 |
+
+### 7.2 RPC 路径
+
+```text
+HTTP /update_weights_*
+  → TokenizerManager.update_weights_*
+  → ZMQ → SchedulerWeightUpdaterManager
+       → model_runner.weight_updater.update_weights_*
+       → flush_cache_after_weight_update（可选清 radix）
+```
+
+| API | 机制 |
+|---|---|
+| `update_weights_from_disk` | 再走 model loader；可 filter 名字 |
+| `init_weights_update_group` + `update_weights_from_distributed` | NCCL 组；bucket 接收 |
+| `update_weights_from_tensor` | 序列化张量 / flattened bucket（RL 常用） |
+| `update_weights_from_ipc` | checkpoint-engine ZMQ+IPC；按 GPU UUID 匹配 handle |
+
+### 7.3 Checkpoint-engine 算法
+
+训练侧（`update.py`）：
+
+1. `--load-format dummy --checkpoint-engine-wait-weights-before-ready` 起 serving
+2. `ParameterServer.register_checkpoint` + `broadcast`/`p2p`
+3. `POST /update_weights_from_ipc` 带 `zmq_handles`
+
+推理侧：`update_weights_from_ipc` → `model.load_weights` → `quant_method.process_weights_after_loading` + `post_load_weights`。
+
+另有 `release_memory_occupation` / `resume_memory_occupation`：RL 迭代间临时让出 GPU 显存。
+
+---
+
+## 8. Compilation：CUDA Graph + torch.compile
+
+### 8.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/model_executor/model_runner_components/cuda_graph_setup.py` | `capture_cuda_graphs` / `capture_prefill_graph` / `capture_decode_graph` |
+| `srt/model_executor/runner/base_cuda_graph_runner.py` | `BaseCudaGraphRunner`：按 shape capture/replay |
+| `srt/model_executor/runner/prefill_cuda_graph_runner.py` | Prefill：`full` / `breakable` / `tc_piecewise` |
+| `srt/model_executor/runner/decode_cuda_graph_runner.py` | Decode batch-size buckets |
+| `srt/model_executor/runner_backend/base_cuda_graph_backend.py` | Backend ABC：`capture_one` / `replay` |
+| `srt/compilation/backend.py` | `SGLangBackend` + `make_backend`（CUDA/NPU/XPU piecewise） |
+| `srt/compilation/compiler_interface.py` | Inductor / Eager adapter |
+| `srt/compilation/cuda_piecewise_backend.py` | torch.compile 分段 + CUDAGraph 包装 |
+
+### 8.2 ModelRunner 挂载
+
+```text
+ModelRunner.init_attention_backends()
+ModelRunner.init_cuda_graphs()
+  → capture_cuda_graphs
+       ├─ EagerRunner（始终创建，作 fallback）
+       ├─ PrefillCudaGraphRunner（可 disabled）
+       └─ DecodeCudaGraphRunner（cuda/musa/cpu/npu/xpu）
+  → 之后 register_forward_hooks（避免进 graph）
+```
+
+`ModelRunner.forward` / `_forward_raw`：若对应 runner `can_run_graph` → `execute`；否则 eager。
+
+### 8.3 重要算法
+
+**A. Decode bucket capture**
+
+`get_batch_sizes_to_capture`：读 `cuda_graph_config.decode.bs`，按 TP/CP alignment 过滤，截到 `max_running_requests`；`compile_bs = bs ≤ torch_compile_max_bs`。
+
+**B. Prefill backend 选择（`cuda_graph_config.prefill`）**
+
+- `full`：整段 prefill 进一张 graph（有 token/req 上限）
+- `breakable`：可在 attention 边界拆
+- `tc_piecewise`：`SGLangBackend` 把 FX graph 按 `register_split_op` 切开 → 每段 Inductor compile → 外层再 CUDAGraph（`CUDAPiecewiseBackend`）
+
+**C. torch.compile 配置**
+
+`set_torch_compile_config()`；模型可设 `_can_torch_compile=False` 强制关。Piecewise 缓存写在 `sglang_compile_cache.py`（`CompilerManager`）。
+
+---
+
+## 9. Continuous Batching / Schedule Policy 内部
+
+### 9.1 关键文件
+
+| 路径 | 职责 |
+|---|---|
+| `srt/managers/schedule_policy.py` | `SchedulePolicy`、`PrefillAdder`、`CacheAwarePolicy`/`CacheAgnosticPolicy` |
+| `srt/managers/scheduler.py` | `_get_new_batch_prefill_raw` 调用点 |
+| `srt/managers/schedule_batch.py` | `ScheduleBatch` / `Req` |
+
+### 9.2 `SchedulePolicy`（排队排序）
+
+CLI：`--schedule-policy` ∈ `lpm` | `dfs_weight` | `fcfs` | `lof` | `random` | `routing_key`。
+
+| 方法 | 行为 |
+|---|---|
+| `calc_priority(waiting_queue, running_batch)` | 入口；可能临时降级 |
+| `_determine_active_policy` | LPM 且 queue>128 → 退回 FCFS（省匹配成本） |
+| `_compute_prefix_matches` | 调 `match_prefix_for_req`；**in-batch prefix caching**：短前缀共享时 deprioritize 多余请求 |
+| `_sort_by_longest_prefix` | LPM：按 `num_matched_prefix_tokens` 降序 |
+| `_sort_by_dfs_weight` | 子树权重 DFS，提高同分支局部性 |
+| `_sort_by_longest_output` | LOF：`max_new_tokens`；可叠加 priority |
+| `_sort_by_routing_key` | 优先调度与 running_batch 同 routing_key 的请求 |
+| `_sort_by_priority_and_fcfs` | `(priority, wait_queue_entry_time)` |
+
+Tree cache disabled 时强制 CacheAgnostic FCFS。
+
+### 9.3 `PrefillAdder`（准入与分块）
+
+在 `calc_priority` 之后构造，字段刻画「本轮还能吃多少 token」：
+
+- `rem_input_tokens` / `rem_chunk_tokens` / `rem_total_tokens`（available + evictable − running 预留下文）
+- hybrid SWA / Mamba unified pool 另有 `rem_swa_tokens`、`rem_mamba_slots`
+
+**`add_one_req(req, has_chunked_req, truncation_align_size)` 主流程：**
+
+1. 预算：`extend_len + max_new + page_size (+ mamba_gap)` vs `rem_total_tokens`
+2. SWA：`_swa_budget_for_req`；不够则 `_swa_chunk_cap` 收紧 chunk
+3. `prefill_delayer_single_pass.negotiate_should_allow_prefill`（负载过高则 OTHER）
+4. host hit：`tree_cache.init_load_back` 填 `prefix_indices`
+5. 若不需分块：`set_extend_range(prefix, full)` → `can_run_list` → `_update_prefill_budget`
+6. 若需分块：按 `page_size`（及可选 `truncation_align_size`）截断 → `new_chunked_req`
+7. 返回 `AddReqResult.CONTINUE | NO_TOKEN | OTHER`
+
+**`preempt_to_schedule`：** 优先级调度下，按阈值差抢占 running（注意 finish 两阶段窗口，避免对已释放 KV 的 req 再 preempt）。
+
+### 9.4 Scheduler 拼装
+
+```text
+_get_new_batch_prefill_raw
+  → GrammarManager.get_ready_grammar_requests
+  → policy.calc_priority(waiting_queue)
+  → PrefillAdder(...)
+  → 处理 chunked_req / 遍历 waiting_queue: adder.add_one_req
+  → ScheduleBatch.init_new(can_run_list) → EXTEND forward
+```
+
+Decode 侧由 `running_batch` 过滤 finished + retract 后继续；新 prefill 可与 decode mixed（`num_mixed_decode_tokens` 从预算扣除）。
+
+---
+
+## 10. Hardware Backend 插件模式
+
+### 10.1 目录布局
+
+```text
+srt/hardware_backend/
+  gpu/quantization/          # CUDA 量化 kernel 封装
+  cpu/quantization/
+  npu/                       # Ascend：attention、MoE、graph_runner、memory_pool、dsv4
+  xpu/                       # Intel：graph_runner、FLA kernels
+  musa/                      # Moore Threads：attention、kernels
+  mlx/                       # Apple：独立 ModelRunner / TpWorker / KV cache
+```
+
+另有平台抽象：`srt/platforms/`（`current_platform`、device mixin）；通用插件：`srt/plugins/`（setuptools entry_points）。
+
+### 10.2 三种接入方式
+
+**A. Attention backend 注册（最常见）**
+
+`layers/attention/attention_registry.py`：
+
+```python
+@register_attention_backend("ascend")
+def create_ascend_backend(runner):
+    from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+    return AscendAttnBackend(runner)
+```
+
+CLI `--attention-backend ascend|dsv4|…`；`dsv4` 内再按 `is_npu` / HIP / CUDA 选实现。
+
+**B. 量化 / MoE 条件导入**
+
+`layers/moe/...`、`layers/quantization/...` 在运行时 `if is_npu(): from sglang.srt.hardware_backend.npu...`。GPU/CPU 也把 method-specific kernel 放到 `hardware_backend/{gpu,cpu}/quantization/`，与贡献指南一致。
+
+**C. 整机替换（MLX）**
+
+`hardware_backend/mlx/tp_worker.py` + `model_runner.py`：不走标准 CUDA ModelRunner，Scheduler mixin / AOT / 自有 KV pool。属于「厚插件」。
+
+**D. Graph / Compile 后端**
+
+`compilation/backend.py::make_backend`：
+
+```text
+out_of_tree platform → platform.get_piecewise_backend_cls()
+XPU → XPUPiecewiseBackend
+NPU → NPUPiecewiseBackend
+else → CUDAPiecewiseBackend
+```
+
+NPU/XPU 另有 `hardware_backend/*/graph_runner/*` 对接 `DecodeCudaGraphRunner` 家族。
+
+### 10.3 Platform 插件（entry points）
+
+`srt/plugins/__init__.py`：
+
+- 组 `sglang.srt.platforms`：注册自定义 `Platform`
+- 组 `sglang.srt.plugins`：通用 hook（`SGLANG_PLUGINS` 白名单；`SGLANG_PLATFORM` 选平台包）
+
+模式总结：**核心路径保持 CUDA 默认实现；设备特化以 registry / lazy import / 厚 runner 三种厚度接入，避免污染 `layers/` 主逻辑。**
+
+---
+
+## 阅读顺序建议
+
+1. `serving_base` → `serving_chat._convert_to_internal_request` → `GenerateReqInput`
+2. `GrammarManager` + `SamplingBatchInfo.update_regex_vocab_mask`
+3. `FunctionCallParser.get_structure_constraint` 与响应侧 `_process_tool_calls`
+4. `get_mm_processor` → `process_mm_data_async` → `general_mm_embed_routine`
+5. `Session.create_req` +（可选）`StreamingSession`
+6. `SchedulePolicy.calc_priority` → `PrefillAdder.add_one_req`
+7. `capture_cuda_graphs` → `BaseCudaGraphRunner.capture`
+8. `WeightUpdater` 四条 update 路径
+9. `hardware_backend` 中与你目标设备对应的 attention/quant 文件
+
+调试时优先在 `TokenizerManager.generate_request`、`Scheduler._get_new_batch_prefill_raw`、`SamplingBatchInfo.update_regex_vocab_mask` 打断点，可同时看到 API 变换、调度准入与 grammar mask。
