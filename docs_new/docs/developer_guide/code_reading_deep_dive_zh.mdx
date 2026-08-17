@@ -447,4 +447,6 @@ HTTP SamplingParams
 2. 在 `PrefillAdder` 打断点，观察 `prefix_indices` 长度与 `alloc_extend` 页数。
 3. 抄 `llama.py` 最小模型改一层 MLP，走通 `EntryClass` + 单测。
 4. 用 `--attention-backend triton` vs `flashinfer` 对比，在 `RadixAttention.forward` 看分流。
+
+进阶：投机解码 / PD / LoRA / 并行 / Kernel 见 [进阶模块精读](/docs/developer_guide/code_reading_notes_advanced_zh)。
 5. 给 `SamplingBatchInfo` 加一个只读 metric（如 batch 内 greedy 比例），确认 overlap 路径仍正确。
