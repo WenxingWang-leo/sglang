@@ -1,468 +1,130 @@
 ---
-title: "SGLang 代码精读笔记（部署与开发）"
-description: "面向独立部署与二次开发的 SGLang 源码精读路线：仓库地图、进程模型、请求全链路、核心类、扩展点与开发工作流。"
+title: "SGLang 代码精读系列总目录"
+description: "SGLang 全仓库实现级精读系列的入口：五篇深度章节覆盖 SRT 主路径、缓存与模型层、进阶子系统、服务扩展与生态组件；附部署要点与学习路线。"
 keywords:
   - sglang
   - code reading
-  - runtime
-  - deployment
+  - architecture
   - developer guide
 ---
 
-本笔记把 SGLang 从「能跑起来」读到「能改代码、能提 PR」。文中路径均相对仓库根目录；类名与函数名以当前 `main` 为准。
+本系列是 **实现级精读**，不是导航清单。每一篇都对着源码讲：类与方法、数据结构、控制流、IPC 契约、不变量与改代码落点。当前合计约 **2900+ 行**，按模块拆成多篇，避免单文件不可读。
 
-配套深读：
+<Note>
+若你只看到过早期「部署与开发」短文：那是系列第 0 篇的雏形。请按下面顺序读 **第 1～5 篇**，那里才是深度解读。
+</Note>
 
-- [SRT 核心服务路径](/docs/developer_guide/code_reading_srt_core_zh)（Engine / TokenizerManager / Scheduler / ModelRunner / Detokenizer / RuntimeContext）
-- [Mem Cache / Models / Layers / Sampling](/docs/developer_guide/code_reading_deep_dive_zh)
-- [投机 / PD / LoRA / 并行 / Kernel](/docs/developer_guide/code_reading_notes_advanced_zh)
-- [API / Grammar / VLM / Session / Observability 等扩展模块](/docs/developer_guide/code_reading_serving_extensions_zh)
+## 系列章节（按推荐顺序）
 
-官方文档入口：[Install](/docs/get-started/install)、[Contribution Guide](/docs/developer_guide/contribution_guide)、[How to Support New Models](/docs/supported-models/support_new_models)。
+| 篇 | 文档 | 覆盖模块 | 深度目标 |
+|---|---|---|---|
+| **1** | [SRT 核心服务路径](/docs/developer_guide/code_reading_srt_core_zh) | Launch / Engine / PortArgs·ZMQ / `io_struct` / TokenizerManager / Scheduler（event loop、batch、overlap）/ TpModelWorker·ModelRunner / Detokenizer / RuntimeContext | 能改启动装配、IPC、调度主循环、forward 边界 |
+| **2** | [Mem Cache / Models / Layers / Sampling](/docs/developer_guide/code_reading_deep_dive_zh) | RadixCache 匹配·split·insert·evict·lock / 页分配器 / HiCache / ModelRegistry·llama 结构·权重加载 / Attention·MoE·Quant / SamplingBatchInfo | 能改前缀缓存、加模型、换 backend、接量化 |
+| **3** | [投机 / PD / LoRA / 并行 / Kernel](/docs/developer_guide/code_reading_notes_advanced_zh) | Speculative V2 workers / PD 状态机与 KV transfer / LoRA 双进程 / TP·PP·DP·EP / JIT·AOT kernels | 能接投机算法、PD 后端、LoRA slot、并行组 |
+| **4** | [服务扩展模块](/docs/developer_guide/code_reading_serving_extensions_zh) | OpenAI·Anthropic HTTP / Grammar 约束解码 / Tool calling / VLM 多模态 / Session / Metrics·Trace / 权重热更新·RL / CUDA Graph·torch.compile / PrefillAdder·SchedulePolicy / Hardware backend | 能改 API 适配、结构化输出、VLM、调度策略、编译路径 |
+| **5** | [生态组件](/docs/developer_guide/code_reading_ecosystem_zh) | Frontend Language（`lang/`）/ sgl-model-gateway / multimodal_gen（Diffusion）/ Test·CI | 能区分 DSL vs SRT、网关路由、扩散运行时、加 CI 测试 |
 
-## 1. 先建立心智模型
+官方配套（操作手册，非精读）：[Install](/docs/get-started/install)、[Contribution Guide](/docs/developer_guide/contribution_guide)、[Support New Models](/docs/supported-models/support_new_models)、[Server Arguments](/docs/advanced_features/server_arguments)。
 
-SGLang 由两层组成：
-
-| 层 | 目录 | 职责 |
-|---|---|---|
-| **SRT（SGLang Runtime）** | `python/sglang/srt/` | 本地模型 serving：调度、KV cache、并行、OpenAI API |
-| **Frontend Language** | `python/sglang/lang/` | 可编程生成 DSL（多后端），不是 HTTP serving 主路径 |
-
-日常部署与开发 **90% 时间在 SRT**。一条请求的最短路径：
+## 一张总图：仓库怎么拼起来
 
 ```text
-Client
-  → FastAPI / OpenAI handler          # 主进程
-  → TokenizerManager.generate_request
-  → ZMQ (io_struct 消息)
-  → Scheduler.event_loop_*            # GPU 子进程
-  → TpModelWorker.forward_batch_generation
-  → ModelRunner.forward
-  → model.forward + RadixAttention
-  → ZMQ → DetokenizerManager
-  → ZMQ → TokenizerManager → HTTP 流式响应
+                         ┌─────────────────────────┐
+                         │  sgl-model-gateway      │  (Rust: LB / PD 路由 / IGW)
+                         └────────────┬────────────┘
+                                      │ HTTP / gRPC
+         ┌────────────────────────────┼────────────────────────────┐
+         ▼                            ▼                            ▼
+┌─────────────────┐      ┌────────────────────┐      ┌─────────────────────┐
+│ SRT HTTP/Engine │      │ SRT Prefill 集群    │      │ SRT Decode 集群      │
+│ TokenizerMgr    │      │ Scheduler(P)        │      │ Scheduler(D)         │
+│ Detokenizer     │      │ KV send             │──────│ KV recv → decode     │
+└────────┬────────┘      └────────────────────┘      └─────────────────────┘
+         │ ZMQ + io_struct
+         ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Scheduler → TpModelWorker → ModelRunner → models/* + RadixAttention      │
+│              ↑ LoRA / Spec draft-verify / Grammar mask / MM embed         │
+│              ↑ mem_cache (RadixCache + paged KV) + distributed groups     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+旁路（不走上述 LLM serving 主路径）：
+  lang/            — 可编程 DSL，可后端连 Runtime/Engine
+  multimodal_gen/  — 扩散 / 图生视频独立运行时
+  kernels/         — JIT/AOT 算子，被 SRT layers 调用
 ```
 
-记住三句话：
+## 心智模型（读第 1 篇前先记住）
 
-1. **主进程负责 tokenize / HTTP**，**每个 GPU rank 一个 Scheduler 子进程做 forward**，**另有 detokenizer 子进程**。
-2. 进程间用 **ZMQ + `managers/io_struct.py` 消息** 通信，不是共享内存直接传 Python 对象（权重/KV 另论）。
-3. **RadixAttention / RadixCache** 是前缀缓存与 paged KV 的核心抽象；模型文件里用 `RadixAttention` 替代普通 Attention。
+1. **三进程**：主进程 tokenize + HTTP；每 GPU rank 一个 Scheduler 做 forward；Detokenizer 独立进程。
+2. **IPC**：ZMQ + `managers/io_struct.py`（msgspec）；大多模态可走 shm。
+3. **RadixAttention / RadixCache**：前缀共享 KV；模型里用 `RadixAttention` 而不是裸 Attention。
+4. **配置**：`ServerArgs` 是种子；业务读 `RuntimeContext` namespace bags；环境变量进 `environ.Envs`。
 
-## 2. 仓库地图
-
-| 路径 | 用途 |
-|---|---|
-| `python/sglang/` | Python 包根 |
-| `python/sglang/srt/` | 推理运行时（本文重点） |
-| `python/sglang/lang/` | 前端语言 |
-| `python/sglang/kernels/` | 统一 kernel 命名空间（JIT / AOT，发布为 `sglang-kernel`） |
-| `python/sglang/multimodal_gen/` | Diffusion / 图生视频 |
-| `python/sglang/cli/` | `sglang serve` 等 CLI |
-| `python/sglang/launch_server.py` | 兼容入口（推荐改用 `sglang serve`） |
-| `test/` | CI 测试（`registered/`、`manual/`、`run_suite.py`） |
-| `python/sglang/test/` | 测试工具库（被 `test/` 引用） |
-| `docs_new/` | Mintlify 文档 |
-| `docker/` | 官方镜像与编排 |
-| `sgl-model-gateway/` | 路由 / PD 网关（Rust） |
-| `benchmark/`、`examples/`、`scripts/` | 压测、示例、CI/release |
-| `.claude/skills/` | Agent 开发约定（改核心类前必读） |
-
-### SRT 内高频目录
-
-| 目录 | 读什么 |
-|---|---|
-| `srt/entrypoints/` | `http_server.py`、`engine.py`、OpenAI/Anthropic/gRPC |
-| `srt/managers/` | `TokenizerManager`、`Scheduler`、`TpModelWorker`、`DetokenizerManager` |
-| `srt/model_executor/` | `ModelRunner`、`ForwardBatch` |
-| `srt/models/` | 各模型实现 + `registry.py` |
-| `srt/mem_cache/` | RadixCache、allocator、HiCache / 外部存储 |
-| `srt/layers/` | Attention / MoE / Quant / RoPE |
-| `srt/speculative/` | EAGLE / MTP 等投机解码 |
-| `srt/disaggregation/` | Prefill–Decode 分离、Encode server |
-| `srt/lora/` | Multi-LoRA |
-| `srt/server_args.py` / `environ.py` / `runtime_context.py` | 配置与进程全局状态 |
-
-## 3. 部署：从安装到可服务
-
-### 3.1 安装选型
-
-| 场景 | 做法 |
-|---|---|
-| 生产 / 快速试用 | `uv pip install --prerelease=allow sglang` 或 Docker `lmsysorg/sglang:latest` |
-| **二次开发** | 源码：`pip install -e "python"`；推荐镜像 `lmsysorg/sglang:dev` |
-| 可复现部署 | **钉死版本 tag**（如 `lmsysorg/sglang:v0.5.16`），不要钉 `latest`/`dev` |
-
-细节见 [Installation](/docs/get-started/install)、[Docker 开发](/docs/developer_guide/development_guide_using_docker)。
-
-源码开发最小步骤：
+## 部署速查（细节仍以官方 Install 为准）
 
 ```bash
-git clone https://github.com/<you>/sglang.git
-cd sglang
-pip install --upgrade pip
-pip install -e "python"
-pip install pre-commit && pre-commit install
-```
+# 开发安装
+pip install -e "python" && pre-commit install
 
-### 3.2 启动入口
-
-推荐：
-
-```bash
+# 推荐启动
 sglang serve --model-path Qwen/Qwen2.5-0.5B-Instruct --host 0.0.0.0 --port 30000
-```
 
-兼容：
-
-```bash
-python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --tp 8
-```
-
-`launch_server.py` 的分支逻辑（读代码时跟这条线）：
-
-| 条件 | 去向 |
-|---|---|
-| `--encoder-only` | Encode server（多模态 PD） |
-| `--smg-grpc-mode` | Legacy SMG gRPC |
-| `--use-ray` | Ray HTTP |
-| 默认 | `entrypoints/http_server.launch_server` |
-
-CLI 实现：`python/sglang/cli/serve.py` → 最终仍落到同一套 `ServerArgs` + `launch_server`。
-
-### 3.3 必会 ServerArgs
-
-定义文件：`python/sglang/srt/server_args.py`（`prepare_server_args()` / `PortArgs`）。
-
-| 字段 | 典型 CLI | 作用 |
-|---|---|---|
-| `model_path` | `--model-path` | 模型路径 / HF id |
-| `tp_size` | `--tp` / `--tp-size` | Tensor parallel |
-| `pp_size` / `dp_size` / `ep_size` | `--pp` / `--dp` / `--ep` | 流水线 / 数据 / 专家并行 |
-| `nnodes` / `node_rank` / `dist_init_addr` | 同名 | 多机 |
-| `mem_fraction_static` | `--mem-fraction-static` | 静态权重+KV 占显存比例 |
-| `attention_backend` | `--attention-backend` | flashinfer / triton / fa3… |
-| `quantization` | `--quantization` | 量化方法 |
-| `speculative_algorithm` | `--speculative-algorithm` | EAGLE / EAGLE3 / MTP… |
-| `enable_lora` / `lora_paths` | `--enable-lora` | Multi-LoRA |
-| `disaggregation_mode` | `--disaggregation-mode` | `null` / `prefill` / `decode` |
-| `chunked_prefill_size` | `--chunked-prefill-size` | Chunked prefill |
-| `max_running_requests` | `--max-running-requests` | 并发上限 |
-
-完整列表：[Server Arguments](/docs/advanced_features/server_arguments)、[Environment Variables](/docs/references/environment_variables)。
-
-### 3.4 常用部署配方
-
-**单机多卡 TP：**
-
-```bash
-sglang serve --model-path MODEL --tp 8 --host 0.0.0.0 --port 30000
-```
-
-**多机（每节点一条，改 `--node-rank`）：**
-
-```bash
+# 多卡 / 多机
+sglang serve --model-path MODEL --tp 8
 python3 -m sglang.launch_server --model-path MODEL --tp 16 \
-  --dist-init-addr 172.16.4.52:20000 --nnodes 2 --node-rank 0
+  --dist-init-addr HOST:20000 --nnodes 2 --node-rank 0
 ```
 
-文档：[Multi-node](/docs/references/multi_node_deployment/multi_node)。
+关键 CLI 字段：`--model-path`、`--tp`/`--pp`/`--dp`/`--ep`、`--mem-fraction-static`、`--attention-backend`、`--quantization`、`--speculative-algorithm`、`--enable-lora`、`--disaggregation-mode`。完整列表见 `srt/server_args.py` 与 [Server Arguments](/docs/advanced_features/server_arguments)。
 
-**Docker：**
+## 学习路线
 
-```bash
-docker run --gpus all --shm-size 32g -p 30000:30000 --ipc=host \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  --env "HF_TOKEN=<secret>" \
-  lmsysorg/sglang:latest \
-  python3 -m sglang.launch_server --model-path MODEL --host 0.0.0.0 --port 30000
-```
+### 路线 A：只想部署运维
 
-**PD 分离：** Prefill / Decode 各起一组进程，`--disaggregation-mode prefill|decode`，前端用 `sgl-model-gateway` 路由。见 [PD Disaggregation](/docs/advanced_features/pd_disaggregation)。
+总目录（本文）→ 官方 Install / Multi-node / PD → 第 1 篇 §1 Launch·PortArgs → 第 3 篇 §2 PD（若用分离）→ 第 5 篇 Gateway。
 
-**验活：**
+### 路线 B：改 serving 核心（调度 / 缓存 / forward）
 
-```bash
-curl http://127.0.0.1:30000/v1/models
-curl http://127.0.0.1:30000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"default","messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
-```
+第 **1** 篇全文 → 第 **2** 篇 Mem cache + Models → 第 **4** 篇 PrefillAdder / CUDA Graph → 本地改一行日志跟 rid。
 
-### 3.5 部署排障清单
+### 路线 C：加模型 / 量化 / attention
 
-1. `CUDA_HOME` 未设置 → FlashInfer / 编译失败。
-2. `--shm-size` / `--ipc=host` 不够 → NCCL 或 tokenizer 共享内存问题。
-3. 多机 `dist_init_addr` 防火墙 / 端口不一致。
-4. OOM：调低 `mem_fraction_static`、减小 `max_running_requests`、开 chunked prefill。
-5. 子进程挂了主进程还活着：看 scheduler 日志；`killall_sglang` 清残留。
+第 **2** 篇 Models + Layers + Quant → [Support New Models](/docs/supported-models/support_new_models) → `bench_one_batch --correct`。
 
-## 4. 进程架构（部署与读码的共同基础）
+### 路线 D：投机 / PD / LoRA / 多卡
 
-`Engine._launch_subprocesses`（`srt/entrypoints/engine.py`）装配整机：
+第 **1** 篇 Scheduler·Worker → 第 **3** 篇全文 → 第 **4** 篇权重热更新（RL）。
 
-| 角色 | 进程 | 职责 |
-|---|---|---|
-| Tokenizer + HTTP | **主进程**（`node_rank==0`） | FastAPI、`TokenizerManager`、可选 TemplateManager |
-| Scheduler | **每 GPU rank 一子进程** | 收请求、组 batch、跑 `ModelRunner` |
-| Detokenizer | **独立子进程**（可多 worker + router） | token → 文本，回传主进程 |
-| 非 0 节点 | 仅 Scheduler（+ dummy health） | 不跑 tokenizer/HTTP |
+### 路线 E：API / 结构化输出 / VLM
 
-IPC 端口在 `PortArgs`：`tokenizer_ipc_name`、`scheduler_input_ipc_name`、`detokenizer_ipc_name`（本机多为 `ipc://`，跨机/DP 可为 TCP）。
+第 **4** 篇 §1–4 → 第 **1** 篇 TokenizerManager 多模态段。
 
-消息类型集中在 `srt/managers/io_struct.py`（如 `GenerateReqInput`）。改协议时先改这里，再改收发两端。
+## 开发约定（改代码前）
 
-### RuntimeContext：配置怎么读
-
-进程单例：`srt/runtime_context.py` → `get_context()`。
-
-| 层级 | 访问器 | 含义 |
-|---|---|---|
-| 原始种子 | `get_server_args()` | 启动时 pristine `ServerArgs`（调试 / dump） |
-| 决议配置 | `get_exec()` / `get_memory()` / `get_schedule()` … | **业务逻辑应读这里** |
-| 运行时 flags | `get_flags()` | 非纯配置状态（cuda graph、MoE backend…） |
-| 资源 | `get_resources()` / `get_stream()` / `get_buffer()` | graph pool、side stream… |
-| 单次 forward | `get_forward()` | contextvar，forward 作用域 |
-
-约定（详见 `.claude/skills/sglang-runtime-context/SKILL.md`）：
-
-- **不要**在业务代码里到处 `os.getenv("SGLANG_...")`；新环境变量进 `srt/environ.py` 的 `Envs`。
-- 发布后改配置：**唯一入口** `get_context().override(...)`；不要写回 `ServerArgs`。
-- Tokenizer / entrypoints 边界可继续读 `self.server_args`（多 Engine 同进程场景）。
-
-## 5. 请求全链路精读
-
-按下面顺序打开文件，对照一次真实请求。
-
-### 5.1 HTTP 入口
-
-- `srt/entrypoints/http_server.py`：`launch_server()`、`/generate`、挂载 OpenAI 路由
-- `srt/entrypoints/openai/serving_chat.py`：`OpenAIServingChat`
-- `srt/entrypoints/openai/serving_base.py`：`handle_request`
-
-OpenAI 路径把 HTTP body 转成 `GenerateReqInput`，再进入 `TokenizerManager`。
-
-### 5.2 TokenizerManager（主进程）
-
-文件：`srt/managers/tokenizer_manager.py`
-
-重点方法：
-
-1. `generate_request` — 异步入口，管理 rid、流式 future
-2. `_tokenize_one_request` — 文本/多模态 → input ids
-3. `_send_one_request` — ZMQ 发往 Scheduler
-
-读码时关注：abort、LoRA adapter 热加载、metrics、与 detokenizer 回包的配对。
-
-### 5.3 Scheduler（GPU 子进程）
-
-文件：`srt/managers/scheduler.py`（大类；改动前读 `.claude/skills/large-class-style/SKILL.md`）
-
-主循环两种：
-
-- `event_loop_normal`：收请求 → `get_next_batch_to_run` → `run_batch` → `process_batch_result`
-- `event_loop_overlap`：CPU 后处理与下一拍 GPU forward 重叠（默认高性能路径）
-
-配套：
-
-| 文件 | 作用 |
+| 主题 | 读 |
 |---|---|
-| `scheduler_components/request_receiver.py` | ZMQ 收包 |
-| `schedule_batch.py` / `schedule_policy.py` | batch 结构与调度策略 |
-| `tp_worker.py` | `TpModelWorker.forward_batch_generation` |
-| `detokenizer_manager.py` | 解码侧 |
+| RuntimeContext / bags / override | `.claude/skills/sglang-runtime-context/SKILL.md` |
+| Scheduler / TokenizerManager / ModelRunner 风格 | `.claude/skills/large-class-style/SKILL.md` |
+| `SGLANG_*` 环境变量 | `.claude/skills/env-var-conventions/SKILL.md` |
+| 写测试 / CI suite | `test/README.md`、`.claude/skills/write-sglang-test/SKILL.md` |
+| JIT / AOT kernel | `.claude/skills/add-jit-kernel`、`add-sgl-kernel` |
 
-`run_batch` 是「调度世界」到「模型世界」的桥：准备 `ForwardBatch`，调用 worker，处理输出 token / finished 标志，再决定写回 cache、发 detokenize。
+## 符号速查（跨篇）
 
-### 5.4 ModelRunner 与模型
-
-- `srt/model_executor/model_runner.py`：`ModelRunner.forward` / `_forward_raw`、attention backend 初始化、cuda graph
-- `srt/model_executor/forward_batch_info.py`：`ForwardBatch`
-- `srt/models/llama.py`：典型因果 LM（`RadixAttention` + `LogitsProcessor` + `EntryClass`）
-- `srt/models/registry.py`：扫描各模块 `EntryClass` → `ModelRegistry`
-
-### 5.5 RadixAttention / KV Cache
-
-- `srt/layers/radix_attention.py`：层侧 attention 接口
-- `srt/mem_cache/radix_cache.py`：前缀树缓存（`Scheduler.tree_cache`）
-- `srt/mem_cache/registry.py`：cache backend 注册（`--radix-cache-backend`）
-- allocator / HiCache / 外部存储：`mem_cache/allocator/`、`mem_cache/storage/`
-
-RadixCache 回答两个问题：这段前缀是否已在 GPU KV 里？没有的话从哪分配 page？读懂它，才能改 chunked prefill、PD KV 传输、多租户缓存策略。
-
-## 6. 开发工作流
-
-### 6.1 日常循环
-
-1. 源码 editable 安装 + `pre-commit install`
-2. 开 feature 分支（不要直接推 `main`）
-3. 改代码 → 本地最小复现（单测或 `bench_one_batch`）
-4. `pre-commit run --all-files`
-5. 按 [Contribution Guide](/docs/developer_guide/contribution_guide) 开 PR，补测试与准确率/性能说明
-
-### 6.2 加新模型（最高频贡献）
-
-官方步骤：[How to Support New Models](/docs/supported-models/support_new_models)。
-
-精简 checklist：
-
-1. 在 `python/sglang/srt/models/` 新增文件（常从 `llama.py` / 相近架构复制）。
-2. 用 SGLang 层：`RadixAttention`、`LogitsProcessor`、`RMSNorm` 等；`forward(..., forward_batch)`。
-3. 文件末尾：`EntryClass = MyForCausalLM`（或 list）。
-4. VLM 额外：`model_config.is_multimodal_model`、`multimodal/processors/`、`pad_input_ids`、`get_image_feature`。
-5. 调试对比：
-   - `python3 scripts/playground/reference_hf.py --model-path MODEL`
-   - `python3 -m sglang.bench_one_batch --correct --model MODEL`
-6. 注册测试：`test/registered/models/test_generation_models.py` 的 `ALL_OTHER_MODELS`；本地：
-   ```bash
-   ONLY_RUN=Org/Model python3 -m unittest test_generation_models.TestGenerationModels.test_others
-   ```
-
-外部包可不改源码：
-
-```python
-from sglang.srt.models.registry import ModelRegistry
-ModelRegistry.models[arch_name] = MyClass
-```
-
-### 6.3 写测试
-
-| 类型 | 位置 | 说明 |
+| 符号 | 文件 | 篇 |
 |---|---|---|
-| 无 GPU 单测 | `test/registered/unit/` | 镜像 `srt/` 目录结构 |
-| CI e2e | `test/registered/<area>/` | 模块级 `register_cuda_ci(...)` |
-| 本地特殊 | `test/manual/` | 不进默认 CI |
-| JIT kernel | `test/registered/jit/` | 与 kernel 源码分离 |
+| `prepare_server_args` / `PortArgs` | `srt/server_args.py` | 1 |
+| `Engine._launch_subprocesses` | `srt/entrypoints/engine.py` | 1 |
+| `TokenizerManager.generate_request` | `srt/managers/tokenizer_manager.py` | 1 |
+| `Scheduler.event_loop_*` / `run_batch` | `srt/managers/scheduler.py` | 1 |
+| `ModelRunner.forward` | `srt/model_executor/model_runner.py` | 1 |
+| `RadixCache.match_prefix` | `srt/mem_cache/radix_cache.py` | 2 |
+| `EntryClass` / `ModelRegistry` | `srt/models/registry.py` | 2 |
+| `EAGLEWorkerV2` | `srt/speculative/eagle_worker_v2.py` | 3 |
+| `PrefillAdder.add_one_req` | `srt/managers/schedule_policy.py` | 4 |
+| `GrammarManager` | `srt/constrained/grammar_manager.py` | 4 |
+| `OpenAIServingChat` | `srt/entrypoints/openai/serving_chat.py` | 4 |
+| `@sgl.function` / `StreamExecutor` | `lang/api.py`、`lang/interpreter.py` | 5 |
 
-跑法：
-
-```bash
-pytest test/registered/unit/mem_cache/ -v
-python3 test/registered/core/test_srt_endpoint.py
-python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small
-```
-
-原则：能 CPU 单测就别拉整服务器；e2e 用最轻 suite（见 `test/README.md`、`.claude/skills/write-sglang-test/SKILL.md`）。
-
-### 6.4 改三大类时的风格
-
-`Scheduler`、`TokenizerManager`、`ModelRunner` 有冻结式约定：
-
-- `__init__` 做编排，细节下沉 mixin / helper / `scheduler_components/`
-- 避免在大类里继续堆几百行业务分支
-- `ModelRunner` 对「再加状态」更敏感——优先查 skill 与现有属性生命周期
-
-见 `.claude/skills/large-class-style/SKILL.md`。
-
-### 6.5 环境变量
-
-新 `SGLANG_*`：
-
-1. 在 `srt/environ.py` 声明（`EnvBool` / `EnvInt` / …）
-2. 文档补 `docs_new/docs/references/environment_variables.mdx`
-3. 禁止散落 `os.getenv("SGLANG_...")`
-
-见 `.claude/skills/env-var-conventions/SKILL.md`。
-
-## 7. 扩展点速查
-
-| 目标 | 目录 | 怎么挂 |
-|---|---|---|
-| Attention backend | `layers/attention/` + `attention_registry.py` | `@register_attention_backend` + `--attention-backend` |
-| 投机解码 | `speculative/` | draft worker + `SpeculativeAlgorithm`；文档 speculative_decoding |
-| 量化 | `layers/quantization/` | `QuantizationConfig` → `QUANTIZATION_METHODS` |
-| LoRA | `lora/` | `--enable-lora` / 运行时 `load_lora_adapter` |
-| PD / Encode | `disaggregation/` + gateway | `--disaggregation-mode`、transfer backend |
-| Radix cache 后端 | `mem_cache/registry.py` | `register_radix_cache_backend` |
-| 轻量 CUDA kernel | `kernels/jit` + `kernels/ops/` | 跟 `add-jit-kernel` skill |
-| 重量级 AOT kernel | `kernels/aot/`（`sglang-kernel`） | 跟 `add-sgl-kernel` skill |
-
-相关文档：
-
-- [JIT Kernel Guide](/docs/developer_guide/development_jit_kernel_guide)
-- [Quantization Contribution](/docs/developer_guide/quantization_contribution_guide)
-- [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling)
-
-## 8. 推荐精读顺序（约 2～3 轮）
-
-### 第一轮：能画图
-
-1. `python/sglang/README.md`
-2. `docs_new/docs/get-started/install.mdx` + `quickstart.mdx`
-3. `python/sglang/launch_server.py` + `cli/serve.py`
-4. `srt/server_args.py`（扫字段，不必一次背完）
-5. `srt/entrypoints/http_server.py`（`launch_server`、generate）
-6. `srt/entrypoints/engine.py`（`_launch_subprocesses`）
-
-**验收**：能默画「三进程 + ZMQ」图，并指出 `PortArgs` 三个 IPC 名。
-
-### 第二轮：跟完一条请求
-
-7. `srt/managers/io_struct.py`
-8. `tokenizer_manager.py`：`generate_request`
-9. `scheduler.py`：`event_loop_overlap` / `run_batch`（先当编排器）
-10. `tp_worker.py`
-11. `model_runner.py`：`forward`
-12. `mem_cache/radix_cache.py` + `layers/radix_attention.py`
-13. `models/llama.py` + `models/registry.py`
-
-**验收**：从 `curl /v1/chat/completions` 指出每个 hop 的文件与函数；能解释 prefix cache hit 发生在哪。
-
-### 第三轮：能下手改
-
-14. `runtime_context.py` + `environ.py` + runtime-context skill
-15. 按任务选读：`attention_registry.py` / `speculative/` / `disaggregation/` / `lora/` / `kernels/README.md`
-16. `test/README.md` + `contribution_guide.mdx`
-17. 做一道最小练习：加一个无害 ServerArgs 字段并在 metrics/log 打出，或给某纯函数补 `test/registered/unit/` 用例
-
-## 9. 最小开发练习（建议按序做）
-
-1. **部署**：本机或 Docker 起 `0.5B～8B` 模型，打通 OpenAI chat。
-2. **读码**：在 `TokenizerManager.generate_request` 与 `Scheduler.run_batch` 各打一行结构化日志，确认 rid 贯通。
-3. **模型**：fork 一个极简模型文件改名注册（或 external registry），跑 `bench_one_batch --correct`。
-4. **测试**：为你改的纯逻辑加 unit test，并 `register_cuda_ci` 或只进 unit suite。
-5. **性能**：对同一模型跑 `bench_serving`，学会看 TTFT / TPOT / 吞吐；再用 [profiling 文档](/docs/developer_guide/benchmark_and_profiling) 抓一条 trace。
-
-## 10. 常见坑
-
-| 坑 | 正确做法 |
-|---|---|
-| 在业务里读 `os.environ["SGLANG_…"]` | 走 `envs.XXX.get()` |
-| 改完 `ServerArgs` 却在别处直接改字段期望全局生效 | `get_context().override` + namespace bags |
-| 在 `Scheduler`/`ModelRunner` 里继续堆巨型方法 | 抽 mixin/component，遵守 large-class skill |
-| 只改模型文件不测 HF 对齐 | `reference_hf` + `bench_one_batch --correct` |
-| e2e 测试放错 suite / 忘记 `register_*_ci` | 对照 `test/README.md` |
-| 多机只改 `tp` 不改 `nnodes`/`node_rank` | 每节点完整一组分布式参数 |
-| PD 模式当单机参数乱配 | 明确 prefill/decode 角色 + gateway |
-
-## 11. 速查：关键符号索引
-
-| 符号 | 文件 |
-|---|---|
-| `prepare_server_args` / `ServerArgs` / `PortArgs` | `srt/server_args.py` |
-| `Envs` | `srt/environ.py` |
-| `get_context` / `RuntimeContext` | `srt/runtime_context.py` |
-| `Engine` / `_launch_subprocesses` | `srt/entrypoints/engine.py` |
-| `launch_server` | `srt/entrypoints/http_server.py` |
-| `TokenizerManager` | `srt/managers/tokenizer_manager.py` |
-| `Scheduler` | `srt/managers/scheduler.py` |
-| `TpModelWorker` | `srt/managers/tp_worker.py` |
-| `DetokenizerManager` | `srt/managers/detokenizer_manager.py` |
-| `ModelRunner` | `srt/model_executor/model_runner.py` |
-| `RadixCache` | `srt/mem_cache/radix_cache.py` |
-| `RadixAttention` | `srt/layers/radix_attention.py` |
-| `ModelRegistry` / `EntryClass` | `srt/models/registry.py` + 各模型文件 |
-
-## 12. 接下来读什么
-
-- 核心路径深读：[Engine / Managers / IPC / RuntimeContext](/docs/developer_guide/code_reading_srt_core_zh)
-- 实现精读：[Mem Cache / Models / Layers / Sampling](/docs/developer_guide/code_reading_deep_dive_zh)
-- 进阶模块：[投机 / PD / LoRA / 并行 / Kernel](/docs/developer_guide/code_reading_notes_advanced_zh)
-- 贡献与 CI：[Contribution Guide](/docs/developer_guide/contribution_guide)、`test/README.md`
-- 加模型：[Support New Models](/docs/supported-models/support_new_models)
-- 生产参数：[Server Arguments](/docs/advanced_features/server_arguments)
-- 社区材料：[sgl-learning-materials](https://github.com/sgl-project/sgl-learning-materials)（slides）
-- 架构深潜：仓库内 `.claude/skills/sglang-runtime-context/SKILL.md`
-
-读完本笔记并做完第 9 节练习后，你应能独立完成：单机/多机部署、沿请求链路定位 bug、按规范加模型或小特征、补测试并开 PR。
+下一篇请直接打开：[SRT 核心服务路径精读](/docs/developer_guide/code_reading_srt_core_zh)。

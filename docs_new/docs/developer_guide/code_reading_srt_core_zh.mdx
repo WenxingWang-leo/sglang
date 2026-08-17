@@ -10,7 +10,9 @@ keywords:
   - code reading
 ---
 
-本页是 [代码精读笔记（部署与开发）](/docs/developer_guide/code_reading_notes_zh) 的**深度续篇**，只覆盖 SRT 主 serving 路径。目标读者：要改调度 / IPC / 启动装配 / forward 边界的工程师。路径相对仓库根；线号以当前 `main` 附近代码为准，读时请对照源文件。
+本页是精读系列第 **1** 篇，覆盖 SRT 主 serving 路径的实现级解读。目标读者：要改调度 / IPC / 启动装配 / forward 边界的工程师。路径相对仓库根；线号以当前 `main` 附近代码为准，读时请对照源文件。
+
+系列导航：[总目录](/docs/developer_guide/code_reading_notes_zh) · [第 2 篇 Cache/Models](/docs/developer_guide/code_reading_deep_dive_zh) · [第 3 篇进阶](/docs/developer_guide/code_reading_notes_advanced_zh) · [第 4 篇服务扩展](/docs/developer_guide/code_reading_serving_extensions_zh) · [第 5 篇生态](/docs/developer_guide/code_reading_ecosystem_zh)
 
 ## 0. 总览：一条请求怎么穿过三个进程
 
