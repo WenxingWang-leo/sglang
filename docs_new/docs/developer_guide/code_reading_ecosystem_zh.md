@@ -11,7 +11,7 @@ keywords:
   - code reading
 ---
 
-本篇是精读系列第 **5** 篇，覆盖不在「单机 LLM Scheduler forward」主链上、但生产与开发高频碰到的生态组件。配套：[系列总目录](/docs/developer_guide/code_reading_notes_zh)、[SRT 核心](/docs/developer_guide/code_reading_srt_core_zh)、[进阶模块](/docs/developer_guide/code_reading_notes_advanced_zh)。
+本篇是精读系列第 **5** 篇，覆盖不在「单机 LLM Scheduler forward」主链上、但生产与开发高频碰到的生态组件。配套：[系列总目录](./code_reading_notes_zh.md)、[SRT 核心](./code_reading_srt_core_zh.md)、[进阶模块](./code_reading_notes_advanced_zh.md)。
 
 ## 边界先划清
 

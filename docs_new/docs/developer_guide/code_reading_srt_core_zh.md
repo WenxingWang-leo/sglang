@@ -12,7 +12,7 @@ keywords:
 
 本页是精读系列第 **1** 篇，覆盖 SRT 主 serving 路径的实现级解读。目标读者：要改调度 / IPC / 启动装配 / forward 边界的工程师。路径相对仓库根；线号以当前 `main` 附近代码为准，读时请对照源文件。
 
-系列导航：[总目录](/docs/developer_guide/code_reading_notes_zh) · [第 2 篇 Cache/Models](/docs/developer_guide/code_reading_deep_dive_zh) · [第 3 篇进阶](/docs/developer_guide/code_reading_notes_advanced_zh) · [第 4 篇服务扩展](/docs/developer_guide/code_reading_serving_extensions_zh) · [第 5 篇生态](/docs/developer_guide/code_reading_ecosystem_zh)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 2 篇 Cache/Models](./code_reading_deep_dive_zh.md) · [第 3 篇进阶](./code_reading_notes_advanced_zh.md) · [第 4 篇服务扩展](./code_reading_serving_extensions_zh.md) · [第 5 篇生态](./code_reading_ecosystem_zh.md)
 
 ## 0. 总览：一条请求怎么穿过三个进程
 
@@ -783,7 +783,7 @@ Draft worker：**不要** publish，以免覆盖 target 的 bags；draft 用自�
 | IPC 字段 | `io_struct.py`（两端一起改 + encode hook） |
 | Tokenize / 流式回包 | `tokenizer_manager.py` |
 | 调度策略 / continuous batching | `schedule_policy.py` `PrefillAdder`、`get_next_batch_to_run`（详见 [服务扩展精读 §9](/docs/developer_guide/code_reading_serving_extensions_zh#9-continuous-batching--schedule-policy-内部)） |
-| OpenAI/Anthropic / Grammar / VLM / Session | [服务扩展模块精读](/docs/developer_guide/code_reading_serving_extensions_zh) |
+| OpenAI/Anthropic / Grammar / VLM / Session | [服务扩展模块精读](./code_reading_serving_extensions_zh.md) |
 | Overlap / stream 同步 | `event_loop_overlap`、`future_map`、`overlap_utils.py` |
 | 结果处理 / 输出频率 | `scheduler_components/batch_result_processor.py`、`output_streamer.py` |
 | Forward / graph / sample | `model_runner.py` 编排 + 其 collaborator；`tp_worker.py` |
@@ -815,5 +815,5 @@ t9  finish_reason 非空 → 清 rid_to_state；HTTP [DONE]
 
 ## 10. 与概览笔记的关系
 
-- 部署 / 仓库地图 / 开发工作流：见 [SGLang 代码精读笔记（部署与开发）](/docs/developer_guide/code_reading_notes_zh)。
+- 部署 / 仓库地图 / 开发工作流：见 [SGLang 代码精读笔记（部署与开发）](./code_reading_notes_zh.md)。
 - 本页专注 **可修改级别的行为与契约**；PD / 投机 / HiCache / Elastic EP 的专门路径在对应 mixin 与 `srt/disaggregation/`、`srt/speculative/`、`srt/mem_cache/` 中继续下钻。

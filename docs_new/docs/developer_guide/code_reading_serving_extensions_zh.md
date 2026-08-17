@@ -16,7 +16,7 @@ keywords:
 
 本篇是精读系列第 **4** 篇，补齐 API / Grammar / VLM / Session / Observability / 权重热更新 / 编译 / 调度策略 / 硬件后端等十个子系统的实现解读。路径相对仓库根；符号以当前代码为准。
 
-系列导航：[总目录](/docs/developer_guide/code_reading_notes_zh) · [第 1 篇](/docs/developer_guide/code_reading_srt_core_zh) · [第 2 篇](/docs/developer_guide/code_reading_deep_dive_zh) · [第 3 篇](/docs/developer_guide/code_reading_notes_advanced_zh) · [第 5 篇](/docs/developer_guide/code_reading_ecosystem_zh)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
 
 ## 总览：扩展点如何挂到主路径
 

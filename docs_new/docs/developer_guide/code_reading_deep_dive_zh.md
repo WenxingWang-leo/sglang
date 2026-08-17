@@ -13,7 +13,7 @@ keywords:
 
 本篇是精读系列第 **2** 篇（实现级）。路径相对仓库根；符号以当前 `main` 为准。
 
-系列导航：[总目录](/docs/developer_guide/code_reading_notes_zh) · [第 1 篇](/docs/developer_guide/code_reading_srt_core_zh) · [第 3 篇](/docs/developer_guide/code_reading_notes_advanced_zh) · [第 4 篇](/docs/developer_guide/code_reading_serving_extensions_zh) · [第 5 篇](/docs/developer_guide/code_reading_ecosystem_zh)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
 
 ## 1. Mem cache / RadixAttention
 
@@ -451,4 +451,4 @@ HTTP SamplingParams
 4. 用 `--attention-backend triton` vs `flashinfer` 对比，在 `RadixAttention.forward` 看分流。
 5. 给 `SamplingBatchInfo` 加一个只读 metric（如 batch 内 greedy 比例），确认 overlap 路径仍正确。
 
-进阶：投机解码 / PD / LoRA / 并行 / Kernel 见 [进阶模块精读](/docs/developer_guide/code_reading_notes_advanced_zh)。
+进阶：投机解码 / PD / LoRA / 并行 / Kernel 见 [进阶模块精读](./code_reading_notes_advanced_zh.md)。

@@ -13,11 +13,9 @@ keywords:
 
 本篇是精读系列第 **3** 篇，按实现级粒度覆盖投机解码、PD、LoRA、分布式与 Kernel；Frontend / Gateway / Diffusion / CI 见第 **5** 篇。路径相对仓库根。
 
-系列导航：[总目录](/docs/developer_guide/code_reading_notes_zh) · [第 1 篇](/docs/developer_guide/code_reading_srt_core_zh) · [第 2 篇](/docs/developer_guide/code_reading_deep_dive_zh) · [第 4 篇](/docs/developer_guide/code_reading_serving_extensions_zh) · [第 5 篇](/docs/developer_guide/code_reading_ecosystem_zh)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
 
-<Note>
-命名约定：投机解码内部计数请遵守 `.claude/skills/speculative-naming/SKILL.md`（`accept_*` 含 bonus，`correct_*` 不含；`bonus_token` 等）。
-</Note>
+> **Note:** 命名约定：投机解码内部计数请遵守 `.claude/skills/speculative-naming/SKILL.md`（`accept_*` 含 bonus，`correct_*` 不含；`bonus_token` 等）。
 
 ## 总览：它们如何挂到主 serving 路径
 
@@ -446,7 +444,7 @@ jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load
 
 §1–5 是本篇主体。下列主题的 **实现级解读**（IR 解释器、Gateway 控制面/策略、扩散 runtime、CI 注册契约）已展开到：
 
-→ **[精读 5：生态组件](/docs/developer_guide/code_reading_ecosystem_zh)**
+→ **[精读 5：生态组件](./code_reading_ecosystem_zh.md)**
 
 此处只保留边界提醒：
 
