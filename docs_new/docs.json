@@ -1008,6 +1008,7 @@
               "docs/developer_guide/contribution_guide",
               "docs/developer_guide/code_reading_notes_zh",
               "docs/developer_guide/code_reading_deep_dive_zh",
+              "docs/developer_guide/code_reading_notes_advanced_zh",
               {
                 "group": "Development",
                 "pages": [
