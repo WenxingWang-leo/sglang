@@ -61,8 +61,13 @@ Sampler                        # 温度 → softmax → top-k/top-p/min-p → �
 
 `layers/logits_processor.py`。三个关键步骤:
 
-1. **选位置(`_get_pruned_states`)**:decode 时每序列最后一个 token;extend 时只取每个序列的最后一个(中间 token 的 logits 无人消费),大幅省算力。
-2. **词表并行 lm_head(`_get_logits`)**:`lm_head` 是 `VocabParallelEmbedding` 的线性形态——vocab 维按 TP 切分,每 rank 只算自己那段,然后 **tensor-parallel all-gather** 拼出全词表 logits。这是 TP 下唯一在模型主体之外的集合通信。
+1. **选位置(`_get_pruned_states`)**:决定「hidden_states 里哪些行需要过 lm_head」。这一步是 prefill 阶段的重要省算点,但**分支比想象中多**:
+   - **decode / target_verify / draft_extend_v2**:每行本来就对应一个待采样位置,`pruned_states = hidden_states` 原样透传,不裁剪;
+   - **extend 且不要 input logprob**(最常见的 prefill 路径):只取每个序列的**最后一个**位置——用 `torch.cumsum(extend_seq_lens) - 1` 算出各序列末尾的偏移。一个 4096 token 的 prompt 只需过 1 行 lm_head 而不是 4096 行,这在大词表模型上省下的算力和显存非常可观;
+   - **extend 且要 input logprob**(`return_logprob=True` 且请求了 prompt logprobs):中间位置的 logits **有人消费**了,必须保留相应区间,不能只留末尾。这也是为什么开启 prompt logprobs 会显著增加 prefill 显存峰值和耗时。
+
+   > 换句话说,「只算最后一个 token」是默认优化而非恒定行为,取决于 `logits_metadata.extend_return_logprob`。为新硬件实现相关算子时,两条路径都要覆盖测试。
+2. **词表并行 lm_head(`_get_logits`)**:`lm_head` 是 `VocabParallelEmbedding` 的线性形态——vocab 维按 TP 切分,每 rank 只算自己那段,然后 **tensor-parallel all-gather** 拼出全词表 logits。这是 TP 下模型主体(每 block 的两次 all-reduce)之外最主要的集合通信;此外采样阶段在特定条件下还有一次 token id 对齐的 all_reduce(见 §5.4)。
 3. **精度处理**:默认把 logits 升到 fp32 再交给采样(数值稳定性);支持 logit softcapping(Gemma 系)。
 
 产出 `LogitsProcessorOutput`:`next_token_logits [num_seqs, vocab]` + logprob 相关字段。
@@ -105,11 +110,15 @@ Sampler                        # 温度 → softmax → top-k/top-p/min-p → �
 ### 5.6 扩展点
 
 ```python
-register_sampler_backend(name, fn)   # 注册新采样后端
-create_sampler(...)                  # 工厂
+# layers/sampler.py
+def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> None:
+    """注册自定义采样后端。注意:factory 返回的是整个 Sampler 实例(子类),
+    会自动把 backend 名加入 SAMPLING_BACKEND_CHOICES(即 --sampling-backend 白名单)。"""
 ```
 
-**适配提示**:新设备先让 `--sampling-backend pytorch` 跑通(纯 torch 算子,任何设备都支持),性能达标后再注册原生后端。
+也就是说,新设备接入采样内核 = **子类化 `Sampler` + 注册工厂**,CLI 白名单自动扩展,无需改 `server_args.py`。
+
+**适配提示**:新设备先让 `--sampling-backend pytorch` 跑通(纯 torch 算子,任何设备都支持),性能达标后再注册原生后端子类。
 
 ---
 

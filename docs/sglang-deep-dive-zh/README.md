@@ -12,9 +12,9 @@
 |---|---|---|---|
 | 01 | [架构总览与启动流程](./01-架构总览与启动流程.md) | 进程拓扑、模块地图、Engine 启动时序、ServerArgs | ★★ |
 | 02 | [请求生命周期与数据流](./02-请求生命周期与数据流.md) | HTTP→分词→调度→前向→回传;Req/ScheduleBatch/ForwardMode | ★★ |
-| 03 | [调度器与连续批处理](./03-调度器与连续批处理.md) | 事件循环(normal/overlap)、拼批、PrefillAdder 预算 | ★ |
+| 03 | [调度器与连续批处理](./03-调度器与连续批处理.md) | 事件循环(normal/overlap)、拼批、PrefillAdder 预算、new_token_ratio 反馈环、retract | ★ |
 | 04 | [内存池与 RadixCache](./04-内存池与RadixCache.md) | KV 三层抽象、基数树、驱逐、容量测算公式 | ★★★ |
-| 05 | [模型层与新增模型](./05-模型层与新增模型.md) | 模型积木、EntryClass 注册、load_weights、实操清单 | ★★★ |
+| 05 | [模型层与新增模型](./05-模型层与新增模型.md) | 模型积木、EntryClass 注册、load_weights、CUDA Graph 机制、实操清单 | ★★★ |
 | 06 | [Attention Backend](./06-Attention-Backend.md) | 后端契约、注册选择、为新硬件写后端 | ★★★ |
 | 07 | [设备抽象与第三方硬件适配](./07-设备抽象与第三方硬件适配.md) | **重点**:platforms/ 插件机制、分发路径、M0–M4 路线图 | ★★★ |
 | 08 | [采样与 Logits 处理](./08-采样与Logits处理.md) | lm_head 词表并行、惩罚、采样后端扩展点 | ★★ |
@@ -86,6 +86,8 @@
 | 主事件循环 | `srt/managers/scheduler.py::event_loop_normal / event_loop_overlap` |
 | 请求状态机 | `srt/managers/schedule_batch.py::Req` |
 | 拼批预算 | `srt/managers/schedule_policy.py::PrefillAdder` |
+| 准入悲观度调节 | `srt/managers/scheduler_components/new_token_ratio_tracker.py` |
+| CUDA Graph 分桶/回放 | `srt/model_executor/runner/{base,decode}_cuda_graph_runner.py` |
 | 前向批 | `srt/model_executor/forward_batch_info.py::ForwardBatch / ForwardMode` |
 | KV 池 | `srt/mem_cache/memory_pool.py`、`srt/mem_cache/allocator/` |
 | 基数树 | `srt/mem_cache/radix_cache.py::RadixCache` |

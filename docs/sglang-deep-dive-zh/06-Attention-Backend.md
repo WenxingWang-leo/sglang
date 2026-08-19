@@ -116,9 +116,16 @@ def register_attention_backend(name):
 4. 兼容层(`arg_groups/overrides.py`)做回退:无 AMX 的 CPU `intel_amx→torch_native`,无 XMX 的 XPU `intel_xpu→triton`。
 5. `ModelRunner.init_attention_backend()` 调工厂建实例,并 stamp `prefill_attention_backend_str` / `decode_attention_backend_str`。
 
-### 3.3 合法名单
+### 3.3 合法名单(与 OOT 免改主仓的注册法)
 
-`server_args.py` 的 `ATTENTION_BACKEND_CHOICES` 是 CLI 的白名单。**新增后端必须把名字加进去**,否则 `--attention-backend` 校验不过:
+`server_args.py` 的 `ATTENTION_BACKEND_CHOICES` 是 CLI 的白名单,`--attention-backend` 会先校验名字。但**改主仓列表不是唯一途径**——`server_args.py` 提供了一组运行时扩展函数:
+
+```363:364:python/sglang/srt/server_args.py
+def add_attention_backend_choices(choices):
+    ATTENTION_BACKEND_CHOICES.extend(choices)
+```
+
+同系列还有 `add_load_format_choices`、`add_quantization_method_choices`、`add_chunked_prefix_cache_attention_backend` 等。OOT 平台插件在自己的 `activate()` / hook 里调用 `add_attention_backend_choices(["mydevice"])` + `register_attention_backend("mydevice")(factory)`,即可**完全不改主仓**接入后端。
 
 ```175:203:python/sglang/srt/server_args.py
 ATTENTION_BACKEND_CHOICES = [
