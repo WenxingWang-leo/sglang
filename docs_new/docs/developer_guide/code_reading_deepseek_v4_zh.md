@@ -11,9 +11,9 @@ keywords:
   - code reading
 ---
 
-本篇是精读系列的 **DeepSeek-V4 专题**，对着源码讲：类层次、forward、压缩 KV、Indexer、MoE/EP、投机与 NPU/HIP 钩子。配套：[系列总目录](./code_reading_notes_zh.md)、[第 2 篇 Cache/Models](./code_reading_deep_dive_zh.md)、[第 3 篇投机/并行](./code_reading_notes_advanced_zh.md)、操作手册 [Cookbook · DeepSeek-V4](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)。
+本篇是精读系列的 **DeepSeek-V4 专题**，对着源码讲：类层次、forward、压缩 KV、Indexer、MoE/EP、投机与 NPU/HIP 钩子。配套：[系列总目录](./code_reading_notes_zh.md)、[第 2 篇 Cache/Models](./code_reading_deep_dive_zh.md)、[第 3 篇投机/并行](./code_reading_notes_advanced_zh.md)、[第 6 篇 第三方硬件接入](./code_reading_hardware_device_zh.md)、操作手册 [Cookbook · DeepSeek-V4](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)。
 
-系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md) · [第 6 篇](./code_reading_hardware_device_zh.md)
 
 > **判定入口：** `srt/configs/model_config.py::is_deepseek_v4(config)` — HF arch ∈ `{DeepseekV4ForCausalLM, DeepseekV4ForCausalLMNextN, DeepseekV4ForCausalLMDSpark}`。与 V3.2 DSA（`is_deepseek_dsa`，看 `index_topk`）是两条线。
 

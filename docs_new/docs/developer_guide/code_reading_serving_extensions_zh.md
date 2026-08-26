@@ -16,7 +16,7 @@ keywords:
 
 本篇是精读系列第 **4** 篇，补齐 API / Grammar / VLM / Session / Observability / 权重热更新 / 编译 / 调度策略 / 硬件后端等十个子系统的实现解读。路径相对仓库根；符号以当前代码为准。
 
-系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md) · [第 6 篇 硬件接入](./code_reading_hardware_device_zh.md)
 
 ## 总览：扩展点如何挂到主路径
 
@@ -594,6 +594,8 @@ NPU/XPU 另有 `hardware_backend/*/graph_runner/*` 对接 `DecodeCudaGraphRunner
 - 组 `sglang.srt.plugins`：通用 hook（`SGLANG_PLUGINS` 白名单；`SGLANG_PLATFORM` 选平台包）
 
 模式总结：**核心路径保持 CUDA 默认实现；设备特化以 registry / lazy import / 厚 runner 三种厚度接入，避免污染 `layers/` 主逻辑。**
+
+DeepSeek-V4 / MoE+MLA 的完整接入清单、NPU/XPU 对照与 `mydevice` 文件级 checklist 见第 **6** 篇：[第三方硬件接入精读](./code_reading_hardware_device_zh.md)。
 
 ---
 

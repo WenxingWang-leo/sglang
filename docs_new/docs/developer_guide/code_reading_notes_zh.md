@@ -1,6 +1,6 @@
 ---
 title: "SGLang 代码精读系列总目录"
-description: "SGLang 全仓库实现级精读系列的入口：五篇深度章节覆盖 SRT 主路径、缓存与模型层、进阶子系统、服务扩展与生态组件；附部署要点与学习路线。"
+description: "SGLang 全仓库实现级精读系列的入口：五篇深度章节 + DeepSeek-V4 专题 + 第三方硬件接入篇；附部署要点与学习路线。"
 keywords:
   - sglang
   - code reading
@@ -8,9 +8,9 @@ keywords:
   - developer guide
 ---
 
-本系列是 **实现级精读**，不是导航清单。每一篇都对着源码讲：类与方法、数据结构、控制流、IPC 契约、不变量与改代码落点。当前合计约 **3000+ 行**（含 DeepSeek-V4 专题），按模块拆成多篇，避免单文件不可读。
+本系列是 **实现级精读**，不是导航清单。每一篇都对着源码讲：类与方法、数据结构、控制流、IPC 契约、不变量与改代码落点。当前合计约 **3800+ 行**（含 DeepSeek-V4 专题与硬件接入篇），按模块拆成多篇，避免单文件不可读。
 
-> **Note:** 若你只看到过早期「部署与开发」短文：那是系列第 0 篇的雏形。请按下面顺序读 **第 1～5 篇**，那里才是深度解读。
+> **Note:** 若你只看到过早期「部署与开发」短文：那是系列第 0 篇的雏形。请按下面顺序读 **第 1～5 篇**，再按需读专题与第 **6** 篇。
 
 ## 系列章节（按推荐顺序）
 
@@ -19,8 +19,9 @@ keywords:
 | **1** | [SRT 核心服务路径](./code_reading_srt_core_zh.md) | Launch / Engine / PortArgs·ZMQ / `io_struct` / TokenizerManager / Scheduler（event loop、batch、overlap）/ TpModelWorker·ModelRunner / Detokenizer / RuntimeContext | 能改启动装配、IPC、调度主循环、forward 边界 |
 | **2** | [Mem Cache / Models / Layers / Sampling](./code_reading_deep_dive_zh.md) | RadixCache 匹配·split·insert·evict·lock / 页分配器 / HiCache / ModelRegistry·llama 结构·权重加载 / Attention·MoE·Quant / SamplingBatchInfo | 能改前缀缓存、加模型、换 backend、接量化 |
 | **3** | [投机 / PD / LoRA / 并行 / Kernel](./code_reading_notes_advanced_zh.md) | Speculative V2 workers / PD 状态机与 KV transfer / LoRA 双进程 / TP·PP·DP·EP / JIT·AOT kernels | 能接投机算法、PD 后端、LoRA slot、并行组 |
-| **4** | [服务扩展模块](./code_reading_serving_extensions_zh.md) | OpenAI·Anthropic HTTP / Grammar 约束解码 / Tool calling / VLM 多模态 / Session / Metrics·Trace / 权重热更新·RL / CUDA Graph·torch.compile / PrefillAdder·SchedulePolicy / Hardware backend | 能改 API 适配、结构化输出、VLM、调度策略、编译路径 |
+| **4** | [服务扩展模块](./code_reading_serving_extensions_zh.md) | OpenAI·Anthropic HTTP / Grammar 约束解码 / Tool calling / VLM 多模态 / Session / Metrics·Trace / 权重热更新·RL / CUDA Graph·torch.compile / PrefillAdder·SchedulePolicy / Hardware backend 概览 | 能改 API 适配、结构化输出、VLM、调度策略、编译路径 |
 | **5** | [生态组件](./code_reading_ecosystem_zh.md) | Frontend Language（`lang/`）/ sgl-model-gateway / multimodal_gen（Diffusion）/ Test·CI | 能区分 DSL vs SRT、网关路由、扩散运行时、加 CI 测试 |
+| **6** | [第三方硬件接入（DeepSeek-V4 / MoE+MLA）](./code_reading_hardware_device_zh.md) | `hardware_backend/`、attention 注册、Quant/MoE、`BaseFusedOp`、communicators、platform plugins、NPU/XPU 样板、DSV4 设备需求、`mydevice` 清单 | 能把新设备接到 MLA/DSA/DSV4 与 EP |
 | **专题** | [DeepSeek-V4 实现精读](./code_reading_deepseek_v4_zh.md) | `deepseek_v4*.py` / dsv4 backend / `DeepSeekV4TokenToKVPool` / mHC·Indexer·Compressor / MoE·EP / NextN·DSpark / NPU·HIP 钩子 / CLI | 能跟一条 V4 请求从 Scheduler 到 sample，并改压缩注意力或设备后端 |
 
 官方配套（操作手册，非精读）：[Install](/docs/get-started/install)、[Contribution Guide](/docs/developer_guide/contribution_guide)、[Support New Models](/docs/supported-models/support_new_models)、[Server Arguments](/docs/advanced_features/server_arguments)、[Cookbook · DeepSeek-V4](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)。
@@ -91,9 +92,13 @@ python3 -m sglang.launch_server --model-path MODEL --tp 16 \
 
 第 **2** 篇 Models + Layers + Quant → [Support New Models](/docs/supported-models/support_new_models) → `bench_one_batch --correct`。
 
-### 路线 F：DeepSeek-V4（压缩注意力 / mHC / DSpark）
+### 路线 F：新硬件 / 第三方设备跑 MoE+MLA / DeepSeek-V4
 
-第 **2** 篇 Mem cache 概念 → **[DeepSeek-V4 专题精读](./code_reading_deepseek_v4_zh.md)** → 第 **3** 篇投机章节 → Cookbook 部署矩阵。
+第 **4** 篇 §10 Hardware 概览 → 第 **6** 篇全文 → 官方 [Plugin System](/docs/hardware-platforms/plugin) → 对照 `hardware_backend/npu/`；模型语义细节可并行读 [DeepSeek-V4 专题](./code_reading_deepseek_v4_zh.md)。
+
+### 路线 G：DeepSeek-V4（压缩注意力 / mHC / DSpark）
+
+第 **2** 篇 Mem cache 概念 → **[DeepSeek-V4 专题精读](./code_reading_deepseek_v4_zh.md)** → 第 **3** 篇投机章节 → Cookbook 部署矩阵；若目标是移植到新芯片，再接路线 F。
 
 ### 路线 D：投机 / PD / LoRA / 多卡
 
@@ -131,5 +136,8 @@ python3 -m sglang.launch_server --model-path MODEL --tp 16 \
 | `GrammarManager` | `srt/constrained/grammar_manager.py` | 4 |
 | `OpenAIServingChat` | `srt/entrypoints/openai/serving_chat.py` | 4 |
 | `@sgl.function` / `StreamExecutor` | `lang/api.py`、`lang/interpreter.py` | 5 |
+| `AttentionBackend` / `@register_attention_backend` | `layers/attention/{base_attn_backend,attention_registry}.py` | 6 |
+| `SRTPlatform` / `load_plugins` | `platforms/interface.py`、`plugins/__init__.py` | 6 |
+| `NpuCommunicator` / `BaseFusedOp` | `distributed/device_communicators/npu_communicator.py`、`kernels/fused_op.py` | 6 |
 
 下一篇请直接打开：[SRT 核心服务路径精读](./code_reading_srt_core_zh.md)。
