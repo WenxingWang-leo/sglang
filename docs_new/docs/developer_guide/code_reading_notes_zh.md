@@ -21,8 +21,9 @@ keywords:
 | **3** | [投机 / PD / LoRA / 并行 / Kernel](./code_reading_notes_advanced_zh.md) | Speculative V2 workers / PD 状态机与 KV transfer / LoRA 双进程 / TP·PP·DP·EP / JIT·AOT kernels | 能接投机算法、PD 后端、LoRA slot、并行组 |
 | **4** | [服务扩展模块](./code_reading_serving_extensions_zh.md) | OpenAI·Anthropic HTTP / Grammar 约束解码 / Tool calling / VLM 多模态 / Session / Metrics·Trace / 权重热更新·RL / CUDA Graph·torch.compile / PrefillAdder·SchedulePolicy / Hardware backend | 能改 API 适配、结构化输出、VLM、调度策略、编译路径 |
 | **5** | [生态组件](./code_reading_ecosystem_zh.md) | Frontend Language（`lang/`）/ sgl-model-gateway / multimodal_gen（Diffusion）/ Test·CI | 能区分 DSL vs SRT、网关路由、扩散运行时、加 CI 测试 |
+| **专题** | [DeepSeek-V4 实现精读](./code_reading_deepseek_v4_zh.md) | `deepseek_v4*.py` / dsv4 backend / `DeepSeekV4TokenToKVPool` / mHC·Indexer·Compressor / MoE·EP / NextN·DSpark / NPU·HIP 钩子 / CLI | 能跟一条 V4 请求从 Scheduler 到 sample，并改压缩注意力或设备后端 |
 
-官方配套（操作手册，非精读）：[Install](/docs/get-started/install)、[Contribution Guide](/docs/developer_guide/contribution_guide)、[Support New Models](/docs/supported-models/support_new_models)、[Server Arguments](/docs/advanced_features/server_arguments)。
+官方配套（操作手册，非精读）：[Install](/docs/get-started/install)、[Contribution Guide](/docs/developer_guide/contribution_guide)、[Support New Models](/docs/supported-models/support_new_models)、[Server Arguments](/docs/advanced_features/server_arguments)、[Cookbook · DeepSeek-V4](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)。
 
 ## 一张总图：仓库怎么拼起来
 
@@ -90,6 +91,10 @@ python3 -m sglang.launch_server --model-path MODEL --tp 16 \
 
 第 **2** 篇 Models + Layers + Quant → [Support New Models](/docs/supported-models/support_new_models) → `bench_one_batch --correct`。
 
+### 路线 F：DeepSeek-V4（压缩注意力 / mHC / DSpark）
+
+第 **2** 篇 Mem cache 概念 → **[DeepSeek-V4 专题精读](./code_reading_deepseek_v4_zh.md)** → 第 **3** 篇投机章节 → Cookbook 部署矩阵。
+
 ### 路线 D：投机 / PD / LoRA / 多卡
 
 第 **1** 篇 Scheduler·Worker → 第 **3** 篇全文 → 第 **4** 篇权重热更新（RL）。
@@ -119,6 +124,8 @@ python3 -m sglang.launch_server --model-path MODEL --tp 16 \
 | `ModelRunner.forward` | `srt/model_executor/model_runner.py` | 1 |
 | `RadixCache.match_prefix` | `srt/mem_cache/radix_cache.py` | 2 |
 | `EntryClass` / `ModelRegistry` | `srt/models/registry.py` | 2 |
+| `DeepseekV4ForCausalLM` / `DeepSeekV4TokenToKVPool` | `srt/models/deepseek_v4.py`、`srt/mem_cache/deepseek_v4_memory_pool.py` | 专题 |
+| `DeepseekV4AttnBackend` (`dsv4`) | `srt/layers/attention/deepseek_v4_backend.py` | 专题 |
 | `EAGLEWorkerV2` | `srt/speculative/eagle_worker_v2.py` | 3 |
 | `PrefillAdder.add_one_req` | `srt/managers/schedule_policy.py` | 4 |
 | `GrammarManager` | `srt/constrained/grammar_manager.py` | 4 |

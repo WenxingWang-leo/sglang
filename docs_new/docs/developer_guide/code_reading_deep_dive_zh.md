@@ -122,7 +122,8 @@ Hybrid：`SWATokenToKVPoolAllocator`、`MambaSlotAllocator`、`HiSparseTokenToKV
 `memory_pool.py` 中 `KVCache` 抽象 + 实现族：
 
 - `MHATokenToKVPool`：经典 MHA/GQA，`k_buffer`/`v_buffer` 按层。
-- `MLATokenToKVPool` / `DSATokenToKVPool`：MLA / DeepSeek sparse。
+- `MLATokenToKVPool` / `DSATokenToKVPool`：MLA / DeepSeek sparse（V3.2 DSA）。
+- `DeepSeekV4TokenToKVPool`：V4 SWA+C4+C128+indexer（详见 [DeepSeek-V4 专题](./code_reading_deepseek_v4_zh.md)）。
 - `HybridLinearKVPool`：full attention + linear/SSM。
 - FP4 / MXFP8 / PageMajor 变体：dtype 与布局特化。
 

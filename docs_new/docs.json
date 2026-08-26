@@ -1012,6 +1012,7 @@
               "docs/developer_guide/code_reading_notes_advanced_zh",
               "docs/developer_guide/code_reading_serving_extensions_zh",
               "docs/developer_guide/code_reading_ecosystem_zh",
+              "docs/developer_guide/code_reading_deepseek_v4_zh",
               {
                 "group": "Development",
                 "pages": [
