@@ -16,7 +16,7 @@ keywords:
 
 本篇是精读系列第 **6** 篇：对着源码说明「新硬件 / 第三方设备」如何挂进 SGLang，并能跑 **DeepSeek-V4**（及一般 **MoE + MLA / DSA** 模型）。路径相对仓库根。
 
-系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md) · [第 6 篇 硬件接入](./code_reading_hardware_device_zh.md)
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md) · [DeepSeek-V4 专题](./code_reading_deepseek_v4_zh.md)
 
 官方操作手册（非精读）：[Plugin System](/docs/hardware-platforms/plugin)、[Ascend NPUs](/docs/hardware-platforms/ascend-npus/getting-started/installation)、[XPU](/docs/hardware-platforms/xpu)。模型语义与 V4 forward 细节另见专题：[DeepSeek-V4 实现精读](./code_reading_deepseek_v4_zh.md)。
 
