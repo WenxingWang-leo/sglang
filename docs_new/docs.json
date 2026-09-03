@@ -1006,6 +1006,15 @@
             "pages": [
               "docs/developer_guide/overview",
               "docs/developer_guide/contribution_guide",
+              "docs/developer_guide/code_reading_notes_zh",
+              "docs/developer_guide/code_reading_srt_core_zh",
+              "docs/developer_guide/code_reading_deep_dive_zh",
+              "docs/developer_guide/code_reading_notes_advanced_zh",
+              "docs/developer_guide/code_reading_serving_extensions_zh",
+              "docs/developer_guide/code_reading_ecosystem_zh",
+              "docs/developer_guide/code_reading_hardware_device_zh",
+              "docs/developer_guide/code_reading_deepseek_v4_zh",
+              "docs/developer_guide/code_reading_mastery_infra_zh",
               {
                 "group": "Development",
                 "pages": [

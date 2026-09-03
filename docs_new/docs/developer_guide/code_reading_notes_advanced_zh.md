@@ -1,0 +1,466 @@
+---
+title: "SGLang 进阶模块精读（投机 / PD / LoRA / 并行 / Kernel）"
+description: "实现级中文精读：投机解码、PD 分离、LoRA、分布式并行、Kernel JIT/AOT，以及 Frontend Language、sgl-model-gateway、multimodal_gen、Test/CI 扩展要点。"
+keywords:
+  - sglang
+  - speculative decoding
+  - PD disaggregation
+  - LoRA
+  - distributed
+  - kernels
+  - code reading
+---
+
+本篇是精读系列第 **3** 篇，按实现级粒度覆盖投机解码、PD、LoRA、分布式与 Kernel；Frontend / Gateway / Diffusion / CI 见第 **5** 篇。路径相对仓库根。
+
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 2 篇](./code_reading_deep_dive_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
+
+> **Note:** 命名约定：投机解码内部计数请遵守 `.claude/skills/speculative-naming/SKILL.md`（`accept_*` 含 bonus，`correct_*` 不含；`bonus_token` 等）。
+
+## 总览：它们如何挂到主 serving 路径
+
+```text
+Client / Gateway
+  → TokenizerManager (+ LoRARegistry)
+  → [可选] DataParallelController 按 DP rank 分发
+  → Scheduler.event_loop_*
+       ├─ 普通 / 投机: model_worker.forward_batch_generation
+       │     ├─ TpModelWorker → ModelRunner (+ LoRAManager.prepare_lora_batch)
+       │     └─ BaseSpecWorker (draft → verify → draft_extend)
+       ├─ PD Prefill: BootstrapQueue → waiting → forward → Inflight 传 KV
+       └─ PD Decode: Prealloc → Transfer → PrebuiltExtend → decode
+  → DetokenizerManager → HTTP/gRPC 流式回包
+```
+
+并行组（TP/PP/EP/DP-attn）在 `ModelRunner` / `TpModelWorker` 启动时由 `srt/distributed/parallel_state.py` 建好；Scheduler 只持有 `ParallelState` 快照。
+
+---
+
+## 1. Speculative decoding（`srt/speculative/`）
+
+### 1.1 架构
+
+投机解码把 **一次 decode step** 拆成：
+
+1. **Draft**：用廉价模型/算法提出若干候选 token（树或链）
+2. **Verify**：用 **target** 模型一次 forward 验证候选，按树掩码做 reject sampling
+3. **Draft extend**：把本步真正 accept 的 token 写进 draft KV / hidden，供下一步 draft 使用
+
+Scheduler **不直接** 调 `TpModelWorker` 做 decode；开启投机后 `self.model_worker = self.draft_worker`（实际类型是各算法的 `*WorkerV2`），对外仍暴露与 `TpModelWorker` 相同的 `forward_batch_generation(batch)` 契约。
+
+```text
+Scheduler.run_batch
+  → model_worker.forward_batch_generation(batch, on_publish=..., grammar_barrier=...)
+       ├─ EXTEND/prefill: target forward(FULL hidden) → draft_extend_for_prefill
+       └─ DECODE: draft() → verify() → draft_extend_for_decode
+            → GenerationBatchResult(+ next_draft_input)
+  → batch.spec_info = next_draft_input   # 供下一 iter
+```
+
+### 1.2 算法枚举与插件注册
+
+| 符号 | 文件 | Worker |
+|---|---|---|
+| `EAGLE` / `EAGLE3` | `eagle_worker_v2.py` | `EAGLEWorkerV2` |
+| multi-layer EAGLE | `multi_layer_eagle_worker_v2.py` | `MultiLayerEagleWorkerV2`（`--enable-multi-layer-eagle`） |
+| `STANDALONE` | `standalone_worker_v2.py` | 独立 draft，复用 EAGLE V2 verify 路径 |
+| `FROZEN_KV_MTP` | `frozen_kv_mtp_worker_v2.py` | MTP，frozen KV |
+| `DFLASH` | `dflash_worker_v2.py` | DFlash 家族 |
+| `DSPARK` | `dspark_components/dspark_worker_v2.py` | 支持 ragged verify |
+| `NGRAM` | `ngram_worker.py` | 无 draft 模型；C++/corpus 查表建树 |
+| 插件 | `spec_registry.py` + `@SpeculativeAlgorithm.register` | `CustomSpecAlgo` |
+
+关键类型：
+
+- `SpeculativeAlgorithm`（`spec_info.py`）：`from_string` / `create_worker` / `is_*()` / `handle_server_args` / `supports_overlap` 相关谓词
+- `SpecInput` / `SpecInputType`：挂在 `ScheduleBatch.spec_info` / `ForwardBatch.spec_info`，区分 DRAFT / DRAFT_EXTEND / VERIFY
+- `BaseSpecWorker` / `EagleDraftWorkerBase`（`base_spec_worker.py`）：统一生命周期（`alloc_memory_pool`、`init_attention_backends`、`init_cuda_graphs`、权重更新）
+
+CLI：`--speculative-algorithm`、`--speculative-num-steps`、`--speculative-num-draft-tokens`、`--speculative-eagle-topk`、draft 模型路径等；各算法在 `arg_groups/speculative_hook.py` 经 `handle_server_args` 改写默认值。
+
+插件扩展：
+
+```python
+@SpeculativeAlgorithm.register("MY_SPEC", supports_overlap=True)
+def _factory(server_args):
+    return MySpecWorker
+```
+
+须 duck-type 完整 `is_*` / `supports_*` 接口（`spec_registry._assert_custom_spec_algo_conforms` 在注册时校验）。V1 worker 路径已删除；不支持 overlap 的算法在 V2 schema 上同步跑并打 deprecated 警告。
+
+### 1.3 EAGLE 控制流（代表路径）
+
+`EAGLEWorkerV2` 组合：
+
+- `_target_worker: TpModelWorker` — 真模型
+- `_draft_worker` — 内嵌另一个 `TpModelWorker` + draft CUDA graph runners
+
+**Prefill / Extend**（`forward_batch_generation` 分支 `is_extend`）：
+
+1. Target forward，`CaptureHiddenMode.FULL`（STANDALONE 用 `NULL`）
+2. `on_publish(new_seq_lens)`（overlap 时让 Scheduler 的 `FutureMap` 提前放行）
+3. `_draft_extend_for_prefill`：用 target hidden + `next_token_ids` 初始化 draft 状态 → `next_draft_input`
+
+**Decode**：
+
+1. `draft(batch)`：`prepare_for_draft` → CUDA graph 或 `draft_forward` 多步采样 → `organize_draft_results` 建树 → `build_eagle_verify_input`
+2. `verify(batch)` → `run_eagle_verify`（`eagle_worker_common.py`）：target 以 `TARGET_VERIFY` 模式一次算 logits，树掩码 + reject sampling → `accept_lens` / bonus token
+3. `_draft_extend_for_decode`：按 accept 路径更新 draft KV/hidden
+
+`topk=1` 时树退化为链，父节点/score index 预分配（`_rebuild_topk1_chain_buffers`），走 `kernels.ops.speculative.topk1` 快路径。
+
+自适应：`adaptive_runtime_state.py` / `adaptive_spec_params.py` 可按 batch size 把 `speculative_num_steps` 降到 0（退化为“单节点 verify = 普通 decode”，仍走 TARGET_VERIFY graph）。
+
+### 1.4 与 Scheduler / ModelRunner 的接缝
+
+**Scheduler 初始化**（`managers/scheduler.py`）：
+
+```text
+init_tp_model_worker()
+maybe_init_draft_worker()          # create_worker → DraftWorkerClass(...)
+init_memory_pools()                # draft 共享 target 的 req/token pool（或算法自管）
+init_all_attention_backends()
+init_all_cuda_graphs()
+model_worker = draft_worker | tp_worker
+```
+
+**`run_batch`**：
+
+- Overlap：`future_map.resolve_seq_lens_cpu` → `resolve_forward_inputs` → `forward_batch_generation(..., on_publish=publish, grammar_barrier=...)` → `batch.spec_info = next_draft_input`
+- 非 Overlap：同步调用 V2 worker，再手工写回 `seq_lens` / `spec_info`
+- Grammar overlap：仅 `supports_grammar_overlap()` 的算法（EAGLE/STANDALONE/DFLASH 家族）在 verify 内推进 FSM
+
+**ModelRunner**：
+
+- `is_draft_worker` 区分 draft/target；CUDA graph capture 用 `create_dummy_verify_input` 造假 `SpecInput`
+- Attention backend 按 `spec_info.is_draft_input()` / `is_verify_input()` 选 custom mask / tree attn
+- `ForwardMode.TARGET_VERIFY`、`spec_scale_global_num_tokens`（DP-attn 下按每请求 token 宽度放大 `global_num_tokens`）
+
+**KV / 显存**：`kv_cache_builder.build_kv_cache(..., spec_algorithm=...)`；`has_draft_kv()` 决定是否为 draft 链预留页（NGRAM 无 draft KV）。PD 下 EAGLE 还传 draft hidden（`carries_draft_hidden_states` + `eagle_disaggregation.py`）。
+
+### 1.5 其它算法差异（读码要点）
+
+| 算法 | 要点 |
+|---|---|
+| EAGLE3 | 仍走 EAGLE worker；aux hidden / layer 选择不同 |
+| Multi-layer | 多份 draft runner，逐步 deepen |
+| STANDALONE | 独立 draft 权重；verify 复用 EAGLE；prefill 可不抓 FULL hidden |
+| FROZEN_KV_MTP | MTP draft，KV 冻结策略；独立 CUDA graph runner |
+| DFLASH | `supports_target_verify_for_draft`；draft 侧也可 target-verify 形态 |
+| DSPARK | 组件化（planner/draft/verify/kv_inject/sts/sps）；`supports_ragged_verify` → token-bucket CUDA graph |
+| NGRAM | 无 draft GPU 模型；`ExternalCorpusManager`；verify-only `NgramVerifyInput` |
+
+Kernel 侧：`python/sglang/kernels/ops/speculative/`（`eagle.py`、`reject_sampling.py`、`spec_tree.py`、`ngram_*`、`dspark/`、`dflash.py` 等）。
+
+### 1.6 扩展点
+
+1. `@SpeculativeAlgorithm.register` + 实现 `BaseSpecWorker.forward_batch_generation`
+2. 新 `SpecInput` 子类 + `SpecInputType`；attention backend 用 `is_draft_input/is_verify_input`，避免硬编码算法名
+3. 算法专属 `handle_server_args` / `build_disagg_draft_input`
+4. 共享工具：`spec_utils.py`（`draft_tp_context`、采样）、`eagle_worker_common.py`、`ragged_verify.py`
+
+---
+
+## 2. PD Disaggregation（`srt/disaggregation/`）
+
+### 2.1 角色与进程拓扑
+
+| 角色 | `DisaggregationMode` | 职责 |
+|---|---|---|
+| Unified | `NULL` | 普通单机：prefill+decode 同进程 |
+| Prefill (P) | `PREFILL` | 只跑 prefill/extend，完成后把 KV（+ aux/state）发给 D |
+| Decode (D) | `DECODE` | 预分配 KV → 收 KV → **跳过** prefill forward（PrebuiltExtend）→ 只 decode |
+| Encode | `--encoder-only` | 多模态 embedding 专用进程（见 2.5） |
+
+客户端通常经 **sgl-model-gateway** 把请求拆到 P/D；请求携带 `bootstrap_host` / `bootstrap_port` / `bootstrap_room`，用于 KV 握手房间号。
+
+Scheduler 通过 mixin 接入：
+
+- `SchedulerDisaggregationPrefillMixin` ← `prefill.py`
+- `SchedulerDisaggregationDecodeMixin` ← `decode.py`
+- PP 变体：`scheduler_pp_mixin.event_loop_pp_disagg_*`
+
+入队分流（`_add_request_to_queue`）：
+
+- NULL → `waiting_queue`
+- PREFILL → `disagg_prefill_bootstrap_queue`
+- DECODE → `disagg_decode_prealloc_queue`
+
+### 2.2 Prefill 生命周期
+
+文件头注释即权威状态机（`prefill.py`）：
+
+```text
+Bootstrap Queue
+  → 每请求建 KVSender，握手 + 对端预分配
+  → poll 成功 → Waiting Queue
+Waiting Queue
+  → PrefillAdder 组 batch → forward
+  → Inflight Queue（发起/推进 KV send）
+Inflight Queue
+  → poll Sender → Success 后结束请求（或 optimistic 路径）
+```
+
+`init_disaggregation`（Scheduler）在 PREFILL 侧创建 `PrefillBootstrapQueue`、`disagg_prefill_inflight_queue`、`MetadataBuffers`、可选 draft KV pool；P 侧 `KVManager.register_to_bootstrap()` 向 bootstrap 登记 RDMA/引擎地址。
+
+`run_batch` 在 PREFILL 可 `maybe_send_cached_prefix_chunk`：先发 radix 已命中的 prefix KV，与 suffix forward 重叠。
+
+### 2.3 Decode 生命周期
+
+```text
+PreallocQueue
+  → 建 KVReceiver，握手；本地有空闲 KV 则预分配
+  → TransferQueue
+TransferQueue
+  → poll Receiver；完成 → waiting（构造 PrebuiltExtendBatch）
+Waiting / Running
+  → forward_mode.is_prebuilt()：只灌 metadata，不跑 prefill compute
+  → merge 进 running_batch 做 decode
+```
+
+`DecodeReqToTokenPool`：把 pre-alloc / transfer 槽位与 running 槽位分开，避免 `--max-running-requests` 堵死 P 侧预分配。
+
+HiCache：`decode_hicache_mixin.py`、`decode_kvcache_offload_manager.py` 在 D 侧重用/卸载层级缓存。
+
+### 2.4 KV 传输抽象与后端
+
+三层：
+
+1. **抽象**（`base/conn.py`）：`BaseKVManager` / `BaseKVSender` / `BaseKVReceiver` / `BaseKVBootstrapServer`；`KVPoll`（Failed…Success）；`KVArgs`（KV/aux/state 指针、层范围、TP 切片元数据、IB 设备等）
+2. **公共逻辑**（`common/conn.py`）：bootstrap HTTP 注册/查询、房间、staging、PP/CP 共识 poll
+3. **后端实现**（`get_kv_class`）：
+
+| `TransferBackend` | 目录 | 典型场景 |
+|---|---|---|
+| `mooncake` | `mooncake/` | 默认 RDMA 传输引擎 |
+| `mori` | `mori/` | 另一套传输栈 |
+| `nixl` | `nixl/` | NIXL |
+| `ascend` | `ascend/` | NPU（可基于 Mooncake bootstrap） |
+| `fake` | `fake/` | 测试无真实 RDMA |
+
+Sender API：`init(num_kv_indices, aux_index)` → `send(kv_indices, state_indices, …)`。  
+除 KV 外还传 **state**（`StateType`：MAMBA / SWA / DSA / SWA_RING / C128_STATE / …）与 **aux**（含 EAGLE draft hidden、DSA seed 等）。P/D 的 metadata schema 必须一致，即使只有 D 开投机。
+
+Bootstrap：各后端 `*KVBootstrapServer`；Decode 用 keep-alive HTTP session 查 `bootstrap_addr`，减少 ephemeral port 耗尽。Rust server 模式可把 bootstrap registry 挂在 rust API listener 上（见 `init_disaggregation` 注释）。
+
+### 2.5 Encode server（多模态 PD）
+
+- 入口：`launch_server` / `--encoder-only` → `encode_server.py`（FastAPI + 独立模型加载）
+- gRPC 变体：`encode_grpc_server.py`
+- Prefill/Decode 侧收 embedding：`encode_receiver.py`（含 `EncoderBootstrapServer`）
+- 负责图像/视频预处理、encoder forward、经 Mooncake 等把 embedding 送到 LLM 侧，避免在 P/D GPU 上重复跑视觉塔
+
+### 2.6 与主路径 / 投机的交叉
+
+- Prefill forward 后不本地 decode，而是进 inflight 传 KV
+- Decode 的 `is_prebuilt()` 在 `run_batch` 早退到 `_run_batch_prebuilt`
+- 投机 + PD：`eagle_disaggregation.build_eagle_disagg_draft_input`；metadata 带 hidden / DSA seed
+- DP：`FOLLOW_BOOTSTRAP_ROOM` 负载均衡让同 room 落到固定 DP rank
+
+### 2.7 扩展点
+
+1. 新 transfer backend：实现 Sender/Receiver/Manager/BootstrapServer，并入 `TransferBackend` + `get_kv_class`
+2. 新 state 类型：扩 `StateType` + `setup_state_kv_args` / `KVArgs` 字段
+3. 队列策略：改 PrefillBootstrap / DecodePrealloc 的 poll 与 abort（peer liveness、optimistic prefill retry）
+4. Encode：扩 `encode_server` 的 modality 路径与 receiver 协议
+
+---
+
+## 3. LoRA（`srt/lora/`）
+
+### 3.1 双进程职责
+
+| 进程 | 组件 | 职责 |
+|---|---|---|
+| Tokenizer（主进程） | `LoRARegistry` | 全局 adapter 目录、引用计数、动态 load/unload 的源真相 |
+| Scheduler / ModelRunner | `LoRAManager` | GPU 权重池、层替换、每 batch 元数据、实际 sgemm |
+
+设计动机：S-LoRA / Punica —— 多 adapter 同 batch，权重进固定 slot 的 memory pool，按 token 选 A/B 矩阵。
+
+### 3.2 关键类型
+
+- `LoRARef`（msgspec）：`lora_id` / `lora_name` / `lora_path` / `pinned`；多机启动用 `deterministic_id(name, path)`（uuid5），避免各节点 uuid4 不一致
+- `LoRARegistry`：`OrderedDict` LRU + `RWLock` + `ConcurrentCounter`；两阶段更新 / 与 Scheduler 最终一致
+- `LoRAAdapter` / `LoRALayer`：CPU 侧权重容器；按 layer 存 A/B；MoE 有 gate/up 归一化
+- `LoRAMemoryPool`：GPU 上 `max_loras_per_batch` 个 buffer slot；`uid_to_buffer_id`；`prepare_lora_batch` 换页
+- `BaseLoRABackend`：`triton` / `torch_native` / `chunked`（`triton_csgmv`）/ `ascend`（`lora/backend/lora_registry.py`）
+- `BaseLayerWithLoRA` / `FusedMoEWithLoRA`（`layers.py`）：替换 base 模块 forward
+
+### 3.3 控制流
+
+**启动**（`ModelRunner.maybe_init_lora_manager`）：
+
+1. 包装 target modules 为 `*WithLoRA`
+2. 建 `LoRAMemoryPool` + backend
+3. 预加载 `--lora-paths`
+
+**请求**：HTTP/io_struct 带 `lora_id` / name → Tokenizer `LoRARegistry.acquire` → Scheduler 组 batch 的 `lora_ids` → `ForwardBatch.init_new`：
+
+```text
+lora_manager.fetch_new_loras(set(lora_ids))   # 缺的则加载/换出
+lora_manager.prepare_lora_batch(forward_batch)
+```
+
+`prepare_lora_batch`：把每个请求的 uid 映射到 `weight_indices`（buffer slot），填 `lora_ranks` / `scalings`，交给 backend（支持 decode/prefill CUDA graph 的 in-place 静态 batch info）。
+
+**动态加载**：Tokenizer API → ZMQ → Scheduler → `ModelRunner.load_lora_adapter` → `LoRAManager.load_lora_adapter`；`pinned` adapter 占用常驻 slot（须 `< max_loras_per_batch - 1` 留驱逐空间）。Overlap loading：`lora_overlap_loader.py`；驱逐：`eviction_policy.py` + `lora_drainer.py`。
+
+### 3.4 Batching 语义
+
+- 同一 batch 最多 `max_loras_per_batch` 个 **不同** adapter（含 base=`None`）
+- Slot 是稀缺资源：未 pinned 的按策略换出
+- DP-attention idle rank：`reset_lora_batch()`，避免读上一 batch 脏元数据
+- MoE：`lora_moe_runners.py` / Marlin 路径；`experts_shared_outer_loras`、`lora_use_virtual_experts`
+
+### 3.5 扩展点
+
+1. 新 backend：实现 `BaseLoRABackend`，在 `backend/lora_registry.get_backend_from_name` 注册
+2. 新 target module：扩 `utils` 的 name 归一化 + `get_lora_layer` 包装
+3. 热更新协议：跟 `io_struct.LoRAUpdateOutput` / Tokenizer ↔ Scheduler 消息走，勿只改一边
+
+---
+
+## 4. Distributed（`srt/distributed/` + DP controller）
+
+### 4.1 并行维度一览
+
+`initialize_model_parallel`（`parallel_state.py`）在 `torch.distributed` 已 init 后创建子组。约束：
+
+```text
+world_size == tp_size * pp_size
+```
+
+（DP 通常通过多进程/多节点复制整模型；`--dp` 由 DataParallelController 拉多组 Scheduler，每组内部再做 TP×PP。）
+
+| 组 | Getter | 作用 |
+|---|---|---|
+| Tensor Parallel `_TP` | `get_tp_group()` | 列/行切权重、all-reduce |
+| Pipeline `_PP` | `get_pp_group()` | 层间微批 |
+| Attn TP `_ATTN_TP` | `get_attn_tp_group()` | DP-attention 下注意力更细 TP |
+| Attn CP / DP | `_ATTN_CP` 等 | context / data 切注意力 |
+| MoE EP / DP / TP | `get_moe_ep_group()` 等 | 专家并行 |
+| DCP | decode context parallel | decode 时 KV 在 TP 内再切（HIP/CUDA） |
+
+`GroupCoordinator` 封装 NCCL/HCCL/自定义 all-reduce（`device_communicators/`：`pynccl`、`custom_all_reduce`、`shm_broadcast`、NPU/XPU…）。
+
+Scheduler 侧 `ParallelState` dataclass（定义在 `distributed/parallel_state_wrapper.py`，不是 `parallel_state.py`）只存 rank 数字；真正通信走 `parallel_state.get_*_group()` 与 `runtime_context.get_parallel()`。
+
+DP-attention：`layers/dp_attention.py` 的 `compute_dp_attention_world_info` / `initialize_dp_attention`；注意力在 DP 维分数据，MLP 仍可能跨 DP 同步（可用 `speculative_skip_dp_mlp_sync` 等开关）。
+
+### 4.2 启动与进程模型
+
+单 DP：
+
+```text
+主进程 TokenizerManager
+  → mp: Scheduler × (tp*pp) 每 GPU 一个
+  → mp: Detokenizer
+```
+
+`dp_size > 1`（`entrypoints/engine.py`）：
+
+```text
+主进程 TokenizerManager
+  → mp: DataParallelController
+        → 再 launch 每 DP worker 的 TP/PP Scheduler 组
+        → 按 LoadBalanceMethod 把 TokenizedGenerateReq 打到 worker ZMQ
+```
+
+Ray 变体：`srt/ray/data_parallel_controller.py` 的 `RayDataParallelController` 用 Actor 代替 `mp.Process`。
+
+### 4.3 DataParallelController
+
+文件：`managers/data_parallel_controller.py`。
+
+**负载均衡**（`LoadBalanceMethod`）：
+
+| 方法 | 行为 |
+|---|---|
+| `ROUND_ROBIN` | 轮询 |
+| `FOLLOW_BOOTSTRAP_ROOM` | PD：同 bootstrap room → 固定 DP（KV 亲和） |
+| `TOTAL_REQUESTS` / `TOTAL_TOKENS` | 读 shm `load_snapshot`，选最闲 |
+
+`DPBudget` 在 dispatch 时启发式 +1，降低风暴。Elastic EP：`dp_active` / `max_ep_size` 可扩槽。控制面消息（profile、weight update、LoRA）广播或按需发送。
+
+### 4.4 扩展点
+
+1. 新通信后端：扩 `device_communicators/` + `GroupCoordinator` 分支
+2. 新并行维：改 `initialize_model_parallel` 构图，并同步 `ServerArgs` / `ParallelState` / `runtime_context`
+3. 新 LB：在 `DataParallelController` 加 `LoadBalanceMethod` + dispatch 函数
+4. 改集体通信语义前读 `.claude/skills/sglang-runtime-context/SKILL.md`（配置袋与进程全局状态）
+
+---
+
+## 5. Kernels（`python/sglang/kernels/`）
+
+### 5.1 统一命名空间（RFC #29630）
+
+```text
+sglang/kernels/
+  spec.py / registry.py / selector.py / fused_op.py
+  ops/<group>/          # 对外可调用算子（activation, moe, speculative, …）
+  jit/                  # JIT CUDA 构建与 runtime（原 jit_kernel）
+  aot/                  # AOT 工程 = 发布包 sgl-kernel / sglang-kernel
+```
+
+用法：
+
+```python
+from sglang.kernels.ops.layernorm import rmsnorm
+from sglang.kernels import select_kernel, KernelBackend
+jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
+```
+
+- `register_kernel(KernelSpec)`：只登记元数据，不触发编译
+- 公共 wrapper 默认走 **AOT `sgl_kernel`**（形状支持最广）
+- 多后端算子用 `BaseFusedOp`：`forward_native` 必选；`forward_triton/jit/aot/...` 可选；`SGLANG_FORCE_FUSED_OP_BACKEND=torch` 可全局回退
+
+### 5.2 JIT vs AOT 怎么选
+
+| | JIT（`kernels/jit`） | AOT（`kernels/aot` → wheel） |
+|---|---|---|
+| 何时 | 轻量、无大型 C++ 依赖、要快速迭代 | 依赖 CUTLASS 等大工程，或必须进 wheel / torch op 注册 |
+| 编译 | 首次调用时本地编译 | CI/发布预编译 |
+| 教程 | `.claude/skills/add-jit-kernel` | `.claude/skills/add-sgl-kernel` |
+| 测试 | `test/registered/kernels/`（及历史 jit 路径约定） | `kernels/aot/tests/` + registered 镜像 |
+
+例外：依赖已由 flashinfer 提供的 CUTLASS 时仍可走 JIT。
+
+### 5.3 与 SRT 的关系
+
+- Serving 热路径大量 `from sglang.kernels.ops...`（含 speculative、moe、kvcache）
+- Model layers 不直接 `#include` AOT；经 Python API / torch ops
+- 加算子：先实现 → 挂 `ops/<group>` → registry → 单测/bench → 再被 layer 引用
+
+### 5.4 扩展点
+
+1. JIT：按 skill 加 `csrc` + Python factory + `ops` wrapper + `test/registered/kernels`
+2. AOT：`csrc` + `sgl_kernel_ops.h` + `common_extension.cc` + CMake + `python/sgl_kernel`
+3. 新 fused op：子类 `BaseFusedOp`，自动进入 parity 测试矩阵
+
+---
+
+## 6. Frontend / Gateway / Diffusion / CI（详见第 5 篇）
+
+§1–5 是本篇主体。下列主题的 **实现级解读**（IR 解释器、Gateway 控制面/策略、扩散 runtime、CI 注册契约）已展开到：
+
+→ **[精读 5：生态组件](./code_reading_ecosystem_zh.md)**
+
+此处只保留边界提醒：
+
+- `lang/` 是 DSL，不是 KV/调度实现处
+- Gateway 做集群路由；KV 与 forward 仍在 SRT
+- `multimodal_gen` ≠ VLM 的 `srt/multimodal`
+- 加测试必须 `register_*_ci` 字面量 + 正确 suite
+
+---
+
+## 推荐精读顺序（进阶）
+
+1. `spec_info.py` + `scheduler.maybe_init_draft_worker` + `eagle_worker_v2.forward_batch_generation`
+2. `disaggregation/utils.py`（枚举与 `get_kv_class`）+ `prefill.py`/`decode.py` 文件头状态机 + `scheduler.init_disaggregation`
+3. `lora_registry.py` + `lora_manager.prepare_lora_batch` + `ForwardBatch` 里对 lora 的调用
+4. `parallel_state.initialize_model_parallel` + `data_parallel_controller.py` 前 200 行
+5. `kernels/README.md` + 选一个 `ops/speculative` 算子顺着调到 worker
+
+相关官方页：[Speculative Decoding](/docs/advanced_features/speculative_decoding)、[PD Disaggregation](/docs/advanced_features/pd_disaggregation)、[LoRA](/docs/advanced_features/lora)、[Server Arguments](/docs/advanced_features/server_arguments)、[sgl-model-gateway](/docs/advanced_features/sgl_model_gateway)。

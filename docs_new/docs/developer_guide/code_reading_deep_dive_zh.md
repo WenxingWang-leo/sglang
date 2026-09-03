@@ -1,0 +1,458 @@
+---
+title: "SGLang 代码精读（二）：Mem Cache / Models / Layers / Sampling"
+description: "面向二次开发的实现级精读：RadixCache 前缀匹配与页分配、模型注册与权重加载、Attention/MoE/量化层、采样批处理。"
+keywords:
+  - sglang
+  - radix cache
+  - RadixAttention
+  - HiCache
+  - model registry
+  - quantization
+  - sampling
+---
+
+本篇是精读系列第 **2** 篇（实现级）。路径相对仓库根；符号以当前 `main` 为准。
+
+系列导航：[总目录](./code_reading_notes_zh.md) · [第 1 篇](./code_reading_srt_core_zh.md) · [第 3 篇](./code_reading_notes_advanced_zh.md) · [第 4 篇](./code_reading_serving_extensions_zh.md) · [第 5 篇](./code_reading_ecosystem_zh.md)
+
+## 1. Mem cache / RadixAttention
+
+### 1.1 三层内存抽象
+
+| 抽象 | 关键类型 | 存什么 |
+|---|---|---|
+| 请求 → token 槽 | `ReqToTokenPool` | `req_to_token[req_pool_idx, pos] = kv_index` |
+| token 槽 → KV 页 | `BaseTokenToKVPoolAllocator` 子类 | 空闲页索引；`alloc` / `free` / `alloc_extend` |
+| KV 物理缓冲 | `KVCache`（`MHATokenToKVPool` / `MLATokenToKVPool` / hybrid…） | 每层 K/V（或 MLA 压缩态）张量 |
+| 前缀树 | `BasePrefixCache`（默认 `RadixCache`） | token 序列 → 可复用的 `kv_index` 路径 |
+
+构建入口：`mem_cache/kv_cache_builder.py::build_kv_cache` → `mem_cache/registry.py::create_tree_cache`。Scheduler 在 `__init__` 里拿到 `self.tree_cache`，之后所有 prefill 准入、锁引用、insert/evict 都走它。
+
+**不变量：**
+
+- `ReqToTokenPool` 第 0 行是 padding：CUDA graph 里未用的 `req_pool_indices` 默认 0，读写落到安全槽。
+- 树节点上的 `value` 是 **page-aligned** 的 `kv_index` 拷贝；树持有一份逻辑引用，请求侧 `req_to_token` 另有一份。
+- 同一前缀被多个请求共享时，物理 KV **不复制**；靠 `lock_ref` 防止被 LRU/LFU 踢掉。
+
+### 1.2 `RadixKey`：匹配命名空间
+
+```text
+RadixKey(token_ids: array[int], extra_key, is_bigram, limit)
+```
+
+- `extra_key`：LoRA id、`cache_salt` 等命名空间。**相同 token 前缀 + 不同 extra_key 永不共享节点。**
+- `is_bigram`：EAGLE 路径。逻辑长度 = `len(token_ids)-1`，边键是重叠 bigram；`value` 与 bigram 对齐截断。
+- `limit`：O(1) 截断视图（SWA re-prefill 尾部、logprob 上限等），避免拷贝。
+- `match(other, page_size)`：指数窗口 + 二分找首分歧点，结果向下取整到 `page_size`。
+- `child_key(page_size)`：第一页（或第一组 bigram）的可哈希字典键；带 `extra_key` 时包装成 `(extra_key, plain)`。
+
+### 1.3 `TreeNode` 与树结构
+
+```text
+root (lock_ref=1, priority=-max)
+  └─ children[child_key] → TreeNode
+        key:   RadixKey 段
+        value: torch.int64 kv indices（device）；None 表示 evicted
+        host_value: HiCache L2 主机索引
+        lock_ref / host_ref_counter
+        last_access_time / hit_count / priority / hash_value
+```
+
+- `children` 用 `defaultdict(TreeNode)`，实际插入时显式赋值。
+- `evicted` ⇔ `value is None`；`backuped` ⇔ `host_value is not None`。
+- `evictable_leaves`：无 device 子节点且 `lock_ref==0` 的节点集合，供 `evict` 堆弹出。
+
+### 1.4 前缀匹配算法（`match_prefix`）
+
+公开 API：`RadixCache.match_prefix(MatchPrefixParams)` → `MatchResult`。
+
+流程：
+
+1. EAGLE → `maybe_to_bigram_view`；空 key / disable → 空结果（锚定 root）。
+2. `key.page_aligned(page_size)`：长度截到页对齐。
+3. `_match_prefix_helper(root, key)`：
+   - 用 `child_key` 找子；
+   - `child.key.match(key)` 得 `prefix_len`；
+   - 若 `prefix_len < len(child.key)` → **`_split_node`**，匹配停在新中间节点；
+   - 否则累加 `child.value`，`key = key[prefix_len:]` 继续。
+4. 返回 `device_indices = cat(values)`，`last_*_node` / `best_match_node` 均为终端节点（无 HiCache 时三者相同）。
+
+`_split_node`：在 `split_len` 处切开，新父节点继承 `lock_ref`/`priority`/`hit_count`，`hash_value` 按页切分。匹配路径上的 split **不复制 KV 物理数据**，只切索引张量视图并 clone 边界。
+
+### 1.5 Insert / Evict / Lock
+
+**Insert**（`_insert_helper`）：
+
+- 沿已有路径推进；路径中部分匹配则 split；剩余后缀挂新叶。
+- `priority` 沿路径取 max（优先级感知驱逐）。
+- `chunked=True` 时跳过 `_inc_hit_count`，避免 chunked prefill 自我抬高 hit。
+- 返回已共享的 `prefix_len`（调用方据此 `free` 重复的 device 页）。
+
+**`cache_finished_req` / `cache_unfinished_req`：**
+
+| 时机 | 行为 |
+|---|---|
+| unfinished（含 chunked） | insert → free 重复段 → 再 `match_prefix` 写回 `req_to_token` → 换锁 `dec_lock(old); inc_lock(new)` |
+| finished | insert（可关）→ free 重复段 + page 不对齐尾巴 → `dec_lock` |
+
+`cache_protected_len`：`page_size>1` 时部分页已写入 `prefix_indices` 但未进树，必须记录保护长度，避免下次 free 漏掉或双重释放。
+
+**Evict：** 对 `evictable_leaves` 建堆（策略来自 `eviction_policy`：lru/lfu/priority…）→ pop → `allocator.free_segment(node.value)` → `_delete_leaf` → 父变叶则入堆。
+
+**Lock：** `inc_lock_ref` / `dec_lock_ref` 沿祖先链增减 `lock_ref`；0↔1 边界调整 `evictable_size_` / `protected_size_`，并更新 leaf 集合。**正在 serving 的请求路径必须 lock。**
+
+### 1.6 页分配器
+
+`allocator/base.py::BaseTokenToKVPoolAllocator`：
+
+- `alloc(need_size)` / `free` / `free_segment(start_pos=…)` / `free_segments`（跨段共享边界页只释放一次）。
+- `free_group_begin/end`：批结束时合并 free，减少碎片整理次数。
+
+`PagedTokenToKVPoolAllocator`（`page_size>1`）：
+
+- 空闲列表是 **页号**；`alloc` 返回展开后的 token 级 indices。
+- `alloc_extend` / `alloc_decode`：根据 `prefix_lens`、`last_loc` 先填满当前尾页，再分配新页（CUDA/HIP kernel 或 naive 路径）。这是 prefill extend 与 decode 一步一页的核心。
+
+`TokenToKVPoolAllocator`：`page_size==1` 的扁平索引池。
+
+Hybrid：`SWATokenToKVPoolAllocator`、`MambaSlotAllocator`、`HiSparseTokenToKVPoolAllocator` 等，把 full / SWA / mamba / sparse 池绑在同一 allocator 接口下。
+
+### 1.7 KV pool 与 builder
+
+`memory_pool.py` 中 `KVCache` 抽象 + 实现族：
+
+- `MHATokenToKVPool`：经典 MHA/GQA，`k_buffer`/`v_buffer` 按层。
+- `MLATokenToKVPool` / `DSATokenToKVPool`：MLA / DeepSeek sparse（V3.2 DSA）。
+- `DeepSeekV4TokenToKVPool`（`mem_cache/deepseek_v4_memory_pool.py`，不在 `memory_pool.py`）：V4 SWA+C4+C128+indexer（详见 [DeepSeek-V4 专题](./code_reading_deepseek_v4_zh.md)）。
+- `HybridLinearKVPool`：full attention + linear/SSM。
+- FP4 / MXFP8 / PageMajor 变体：dtype 与布局特化。
+
+`kv_cache_builder.build_kv_cache`：
+
+1. 从 `tp_worker` 取已分配的 `req_to_token_pool` + allocator；
+2. 判定 `is_hybrid_swa` / `is_hybrid_ssm` / `is_dsa`；
+3. 组装 `CacheInitParams`（含 EAGLE、eviction_policy、PP/TP cache group、sliding_window…）；
+4. `create_tree_cache(TreeCacheBuildContext)`。
+
+### 1.8 Registry：选哪种树
+
+`registry.default_radix_cache_factory` 选择链（简化）：
+
+```text
+disable_radix + chunked → ChunkCache / SWAChunkCache
+SGLANG_EXPERIMENTAL_CPP_RADIX_TREE → RadixCacheCpp
+SGLANG_ENABLE_UNIFIED_RADIX_TREE | MLX → UnifiedRadixCache
+hybrid SWA 且 full_tokens_per_layer==0 → PureSWARadixCache
+其余 hybrid SWA/SSM → UnifiedRadixCache
+enable_hierarchical_cache → HiRadixCache（纯 KV）或 Unified+init_hicache
+enable_lmcache / enable_flexkv → 对应子类（非薄包装）
+else → RadixCache
+（create 之后可再包一层 StreamingSession）
+```
+
+`--radix-cache-backend <name>` 走 `register_radix_cache_backend` 的插件工厂。
+
+`UnifiedRadixCache`：`ComponentType.FULL` + 可选 `SWA` / `MAMBA`；多组件校验后才接受 `best_match_node`；HiCache 通过 `init_hicache` 挂上。
+
+### 1.9 Scheduler 在 prefill 里怎么用 `tree_cache`
+
+数据流：
+
+```text
+Req 入队
+  → Req.init_next_round_input(tree_cache) / match_prefix_for_req
+      · match_prefix → prefix_indices, last_node, host_hit_length…
+      · 最多匹配到 input_len-1（留给至少一个 token 算 logprob）
+      · SWA：swa_reprefill_tail_tokens() 截断，强制重算窗口尾
+  → SchedulePolicy（LPM / DFS_WEIGHT / FCFS…）按前缀命中排序
+  → PrefillAdder 估算 rem_total_tokens =
+        allocator.available_size() + tree_cache.evictable_size() - offset
+      · 不够则 tree_cache.evict(...)
+      · 分配 req_pool + kv pages（alloc_extend）
+      · inc_lock_ref(last_node)
+  → batch.prepare_for_extend() → ModelRunner forward
+  → 结束后 cache_unfinished_req / cache_finished_req
+```
+
+HiCache 额外：命中 host 时 `init_load_back`；可 `prefetch_from_storage`；event loop 里 `check_hicache_events()`。
+
+### 1.10 `RadixAttention`（层侧）
+
+`layers/radix_attention.py::RadixAttention` 是模型里的 attention **模块**，不是缓存树：
+
+- 构造时记下 `layer_id`、head 布局、`sliding_window_size`、可选 `quant_method`。
+- `forward(q,k,v, forward_batch, save_kv_cache=…)`：
+  - reshape K/V；
+  - extend + tc-piecewise 路径走 `unified_attention_with_output` 自定义 op（可进 graph）；
+  - 否则 `get_attn_backend().forward(...)`。
+- 真正写/读 KV 在 **attention backend**，用 `forward_batch` 里的 `req_to_token` / `out_cache_loc` 等索引。
+
+修改点：新 attention 变体优先加 backend；模型侧只换 `RadixAttention` 参数或 kwargs（如 indexer、descale）。
+
+### 1.11 HiCache / 存储后端
+
+层次：
+
+| 层 | 位置 | 角色 |
+|---|---|---|
+| L1 | GPU `KVCache` + Radix 树 `value` | 在线推理 |
+| L2 | `pool_host/*`（`MHATokenToKVPoolHost` 等） | 主机内存备份 / write-through |
+| L3 | `HiCacheStorage` | 跨进程/跨机持久或远端 |
+
+`HiRadixCache(RadixCache)`：构造 host pool + `HiCacheController`；`load_back` / `prefetch_from_storage` / write-through；节点 `host_value` + `hash_value`（页哈希，L3 key）。
+
+`hicache_storage.py`：`PoolName`（KV / MAMBA / SWA / DRAFT / DeepSeek V4…）、`PoolTransfer`、`PoolHitPolicy`（全页 vs 尾页）。
+
+`StorageBackendFactory` 已注册：`file`、`nixl`、`mooncake`、`hf3fs`、`aibrix`、`eic`、`simm`、`mori`(UMBP)、`shm`；也支持 `dynamic` 按 extra_config 加载。
+
+**常见修改点：**
+
+- 新驱逐策略 → `evict_policy.py` + `get_eviction_strategy`
+- 新树实现 → `register_radix_cache_backend`
+- 新 L3 → 实现 `HiCacheStorage` + `StorageBackendFactory.register_backend`
+- 改匹配语义 → `RadixKey` / `_match_prefix_helper`（小心 page/bigram/extra_key）
+
+---
+
+## 2. Models & registry
+
+### 2.1 `models/registry.py`
+
+```text
+pkgutil.iter_modules(sglang.srt.models)
+  → import module
+  → 读 EntryClass（类型或 list）
+  → models[ClassName] = cls
+
+ModelRegistry.resolve_model_cls(architectures)
+  → 过滤已注册名；未命中追加 TransformersForCausalLM 兜底
+  → 按序返回第一个可加载类
+```
+
+- `SGLANG_DISABLED_MODEL_ARCHS`：跳过模块。
+- `SGLANG_EXTERNAL_MODEL_PACKAGE`：外部包 `register(..., overwrite=True)`。
+- **注册键是 Python 类名**，需与 HF `config.architectures` 对齐（或靠兜底 Transformers）。
+
+### 2.2 `llama.py` 结构（模板）
+
+| 类 | 职责 |
+|---|---|
+| `LlamaMLP` | `MergedColumnParallelLinear(gate_up)` + `SiluAndMul` + `RowParallelLinear(down)` |
+| `LlamaAttention` | `QKVParallelLinear` → `get_rope` → `RadixAttention` → `o_proj` |
+| `LlamaDecoderLayer` | pre-norm residual 融合：`RMSNorm(x, residual)` → attn → norm → mlp |
+| `LlamaModel` | embed（PP first）+ `make_layers` + final norm（PP last）；中间 rank 返回 `PPProxyTensors` |
+| `LlamaForCausalLM` | `model` + `ParallelLMHead`/`tie` + `LogitsProcessor` + `Pooler`；`load_weights` / `stacked_params_mapping` |
+| `EntryClass = [LlamaForCausalLM, Phi3…, …]` | 多架构共用一份实现 |
+
+前向数据流：
+
+```text
+input_ids → embed → (hidden, residual=None)
+  → for layer: norm+attn, norm+mlp（residual 贯穿）
+  → final norm → LogitsProcessor(lm_head) → LogitsProcessorOutput
+```
+
+`forward_split_prefill`：按层区间切分 prefill（PD / layer-wise），状态挂在 `forward_batch.hidden_states/residual`。
+
+权重：`stacked_params_mapping` 把 HF 的 `q/k/v`、`gate/up` 打进融合参数；`SGLANG_ENABLE_WEIGHT_LOADER_V2` 走 `_load_weights_v2`。
+
+### 2.3 权重加载（`model_loader/`）
+
+| 组件 | 作用 |
+|---|---|
+| `loader.py` | `BaseModelLoader` 族：`DefaultModelLoader`、`LayeredModelLoader`、`GGUF`、`BitsAndBytes`、`ShardedState`、`RemoteInstance`… |
+| `_initialize_model` | `get_model_architecture` → 建模块骨架（已带 quant_config） |
+| `weight_utils.py` | `default_weight_loader`、safetensors/HF 迭代、scale remap |
+| `auto_loader.py` | 标准 gate_up 等映射辅助 |
+
+典型路径：`download_model` → 构造空模型 → 迭代 `(name, tensor)` → 模型 `load_weights` 或通用 loader → `process_weights_after_loading`（quant method 转置/打包）。
+
+量化配置：`_get_quantization_config` 用 `QUANTIZATION_METHODS` + 平台覆盖。
+
+### 2.4 多模态钩子
+
+模型类（如 `qwen2_vl.py`、`llava` 系）实现：
+
+| 钩子 | 何时 | 做什么 |
+|---|---|---|
+| Processor（TokenizerManager 侧） | HTTP 入站 | 图像/视频 → `MultimodalInputs` / pixel tensors |
+| `pad_input_ids(input_ids, mm_inputs)` | tokenize 后 | 插入 image placeholder token，对齐特征长度 |
+| `get_image_feature(items)` | forward 前/中 | vision tower → 与 hidden 同宽的 embedding |
+
+Scheduler/ModelRunner 在 embedding 阶段把 image feature scatter 进 `input_embeds`。多模态 + Transformers backend 时 `build_kv_cache` **强制 disable radix**，避免 token 相同但视觉不同导致错误共享。
+
+### 2.5 代码级加新模型
+
+1. 新增 `srt/models/my_model.py`，实现 `ForCausalLM`（或 Encoder）+ `EntryClass = MyForCausalLM`。
+2. Attention 用 `RadixAttention`；Linear 用 TP 包装类；Norm 用 `RMSNorm`/`LayerNorm`。
+3. 实现 `load_weights`（或依赖通用 stacked mapping）。
+4. 多模态则加 `pad_input_ids` / `get_image_feature` + processor 注册。
+5. HF `architectures` 含类名；必要时改 `ModelConfig` 探测。
+6. 测例按 `write-sglang-test` skill / `test/README.md` 注册。
+
+外部包：设 `SGLANG_EXTERNAL_MODEL_PACKAGE`，无需改仓库。
+
+---
+
+## 3. Layers
+
+### 3.1 Attention backend 注册与选择
+
+`layers/attention/attention_registry.py`：
+
+```python
+ATTENTION_BACKENDS = {}
+@register_attention_backend("flashinfer")
+def create_flashinfer_backend(runner): ...
+```
+
+已注册名包括：`flashinfer`、`triton`、`fa3`/`fa4`、`torch_native`、`flex_attention`、`flashmla`、`cutlass_mla`、`trtllm_mha`/`trtllm_mla`、`aiter`、`wave`、`ascend`、`dsa`（`nsa` 弃用别名）、`dsv4`、`intel_amx`、`hpc_ops`、`dual_chunk_flash_attn`、`tokenspeed_mla`、`cutedsl_mla` 等。
+
+选择路径：
+
+```text
+ServerArgs.get_attention_backends() → (prefill_str, decode_str)
+ModelRunner.init_attention_backends()
+  → attention_backend_setup.build_attention_backends
+      · draft worker 可被 speculative_draft_attention_backend 覆盖
+      · pdmux / two_batch_overlap 包装多实例或 TboAttnBackend
+      · ATTENTION_BACKENDS[name](runner)
+      · attn_backend_wrapper：hybrid GDN/Mamba/MiniMax/Inkling 再包一层
+```
+
+`AttentionBackend`（`base_attn_backend.py`）契约：
+
+- `init_forward_metadata` / `_out_graph` / `_in_graph`：eager vs CUDA graph 元数据；
+- `forward(q,k,v, layer, forward_batch, save_kv_cache)`：真正 attention + 可选写 cache。
+
+`RadixAttention` 经 `get_attn_backend()`（forward context）调到当前 backend。
+
+**修改点：** 新 kernel → `@register_attention_backend` + ServerArgs 校验；hybrid 模型优先改 `attn_backend_wrapper` 而不是每个 backend。
+
+### 3.2 MoE 概览（`layers/moe/`）
+
+| 模块 | 角色 |
+|---|---|
+| `fused_moe_triton/layer.py::FusedMoE` | 模型侧 MoE 层：专家权重 + router 对接 |
+| `topk.py::TopK` | top-k 路由（多平台） |
+| `moe_runner/` | 执行后端：triton、deep_gemm、aiter、flashinfer_cutlass/trtllm、marlin、ascend、hpc_ops… |
+| `token_dispatcher/` | EP 下 token 分发 / combine（DeepEP 等） |
+| `ep_moe/`、`mega_moe*` | 大规模专家并行路径 |
+
+`FusedMoE` 数据流（逻辑）：
+
+```text
+hidden → gate/topk → dispatcher.dispatch
+  → MoeRunnerCore.run（按 quant 选 kernel）
+  → dispatcher.combine → 输出
+```
+
+量化走 `FusedMoEMethodBase`：`create_weights` / `create_moe_runner` / `apply`。
+
+### 3.3 量化框架（`QUANTIZATION_METHODS`）
+
+`layers/quantization/__init__.py`：
+
+```text
+BASE_QUANTIZATION_METHODS = {
+  "fp8": Fp8Config, "awq": AWQConfig, "gptq": GPTQConfig,
+  "modelopt_fp8": ..., "compressed-tensors": ..., "mxfp4": ..., ...
+}
+QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}  # 平台可再改
+get_quantization_config(name) → Type[QuantizationConfig]
+```
+
+CPU/NPU/HIP 有条件覆盖（如 NPU 上 `mxfp4` → `Mxfp4W4A4Config`）。
+
+`QuantizationConfig`：
+
+- `get_quant_method(layer, prefix)` → `QuantizeMethodBase` 或 `None`（该层不量化）；
+- Linear → `LinearMethodBase.create_weights` / `apply`；
+- MoE → `FusedMoEMethodBase`；
+- `process_weights_after_loading` 做打包。
+
+层构造：`quant_config.get_quant_method(self, prefix)`（见 `RadixAttention`、各类 Linear）。CLI `--quantization` / 权重 metadata 决定方法名。
+
+**加新量化：** 实现 `QuantizationConfig` + Method → 注册进 `BASE_QUANTIZATION_METHODS` → 补 loader 与测例；参考 `quantization_contribution_guide`。
+
+### 3.4 常用层
+
+| 层 | 文件 | 要点 |
+|---|---|---|
+| Linear | `layers/linear.py` | `ColumnParallel` / `RowParallel` / `QKVParallel` / `MergedColumn`；内嵌 quant method |
+| RMSNorm | `layers/layernorm.py` | 支持 `(x, residual)` 融合；与 DecoderLayer 约定一致 |
+| RoPE | `layers/rotary_embedding.py` | `get_rope(...)` 工厂；scaling / neox / partial rotary |
+| LogitsProcessor | `layers/logits_processor.py` | `LogitsProcessor.forward` → `LogitsProcessorOutput`（logits / logprobs / hidden）；接采样前处理 |
+
+PP：`PPMissingLayer` 占位非本 rank 的 embed/norm。
+
+---
+
+## 4. Sampling（`srt/sampling/`）
+
+### 4.1 `SamplingParams`
+
+`msgspec.Struct`，跨进程 msgpack 友好。字段分 API（`temperature`、`top_p`、`top_k`、`min_p`、penalties、`json_schema`/`regex`/`ebnf`、`logit_bias`、`custom_params`…）与 `normalize()` 后内部字段（`stop_strs`、`stop_str_max_len`…）。
+
+`TOP_K_ALL = 1<<30` 表示“不限制 top-k”。`temperature≈0` 在 **`normalize()`**（不是 `verify()`）里折成 greedy（`top_k=1`）。
+
+### 4.2 `SamplingBatchInfo`
+
+由 `ScheduleBatch` 构造，把每请求标量堆成 GPU 张量：
+
+- `temperatures`、`top_ps`、`top_ks`、`min_ps`
+- 标志位：`is_all_greedy` / `need_top_p_sampling` / …
+- `grammar_mask` + `grammars`：结构化输出
+- `penalizer_orchestrator`：presence / frequency / repetition / min_new_tokens
+- `custom_logit_processor`：可选用户处理器
+- `logit_bias`、`sampling_seed`（确定性推理）
+
+Overlap 调度下用 `acc_additive_penalties` / `acc_scaling_penalties` 累积，避免重复扫请求。
+
+### 4.3 Penalizer
+
+`penaltylib/orchestrator.py::BatchedPenalizerOrchestrator`：
+
+- 持有各类 `_BatchedPenalizer`；
+- `cumulate_output_tokens` 更新统计；
+- `apply(logits)` 原地改 logits；投机解码 `repeat=` 时用 `repeat_interleave` 对齐 draft 维。
+
+### 4.4 数据流与不变量
+
+```text
+HTTP SamplingParams
+  → TokenizerManager 规范化
+  → Req.sampling_params
+  → ScheduleBatch → SamplingBatchInfo.from_schedule_batch
+  → ModelRunner 得到 logits
+  → penalties → grammar mask → logit_bias → custom processor
+  → softmax+topk/topp 或 greedy → next token ids
+```
+
+**不变量：**
+
+- `custom_params` 必须 JSON 可序列化；`Req` 注入的 `__req__` 只活在 scheduler 进程内。
+- Logits 改写顺序（当前实现）：**penalty → grammar mask → logit_bias → custom processor → sample**。改采样路径时保持批内一致，不要假设 bias 一定在 mask 之前。
+- Deterministic 模式依赖 `sampling_seed` 张量；与 radix `disable_finished_insert` 等开关联动。
+
+**常见修改点：** 新惩罚 → 新 `BatchedPenalizer` 并挂到 orchestrator；新约束 → grammar backend；自定义 logits → `CustomLogitProcessor` + server 开关。
+
+---
+
+## 5. 横切：改代码时盯住的不变量
+
+1. **页对齐：** 树 key/value、HiCache 页、allocator free_segment 的 `start_pos` 必须一致；`page_size>1` 时 partial page 用 `cache_protected_len`。
+2. **Lock 对称：** 每个 `inc_lock_ref` 必须有匹配 `dec_lock_ref`（完成、abort、retract 路径都要覆盖）。
+3. **extra_key / 多模态：** 错误共享比不命中更糟；不确定就 disable radix 或换 salt。
+4. **Backend 与图：** 改 attention metadata 要同时想 eager、capture、replay；遵守 `_out_graph` / `_in_graph` 分工。
+5. **量化与 TP：** `create_weights` 的 partition 尺寸必须与 ParallelLinear 一致；MoE 还要对齐 EP 物理专家数。
+
+## 6. 建议动手实验
+
+1. 对 `RadixCache.create_simulated()` 插入几条分叉前缀，打印 `pretty_print`，再 `match_prefix` / `evict`。
+2. 在 `PrefillAdder` 打断点，观察 `prefix_indices` 长度与 `alloc_extend` 页数。
+3. 抄 `llama.py` 最小模型改一层 MLP，走通 `EntryClass` + 单测。
+4. 用 `--attention-backend triton` vs `flashinfer` 对比，在 `RadixAttention.forward` 看分流。
+5. 给 `SamplingBatchInfo` 加一个只读 metric（如 batch 内 greedy 比例），确认 overlap 路径仍正确。
+
+进阶：投机解码 / PD / LoRA / 并行 / Kernel 见 [进阶模块精读](./code_reading_notes_advanced_zh.md)。
