@@ -283,7 +283,7 @@ Bootstrap：各后端 `*KVBootstrapServer`；Decode 用 keep-alive HTTP session 
 - `LoRARegistry`：`OrderedDict` LRU + `RWLock` + `ConcurrentCounter`；两阶段更新 / 与 Scheduler 最终一致
 - `LoRAAdapter` / `LoRALayer`：CPU 侧权重容器；按 layer 存 A/B；MoE 有 gate/up 归一化
 - `LoRAMemoryPool`：GPU 上 `max_loras_per_batch` 个 buffer slot；`uid_to_buffer_id`；`prepare_lora_batch` 换页
-- `BaseLoRABackend`：`triton` / `torch` / `chunked` / `ascend`（`lora/backend/`）
+- `BaseLoRABackend`：`triton` / `torch_native` / `chunked`（`triton_csgmv`）/ `ascend`（`lora/backend/lora_registry.py`）
 - `BaseLayerWithLoRA` / `FusedMoEWithLoRA`（`layers.py`）：替换 base 模块 forward
 
 ### 3.3 控制流
@@ -343,7 +343,7 @@ world_size == tp_size * pp_size
 
 `GroupCoordinator` 封装 NCCL/HCCL/自定义 all-reduce（`device_communicators/`：`pynccl`、`custom_all_reduce`、`shm_broadcast`、NPU/XPU…）。
 
-Scheduler 侧 `ParallelState` dataclass 只存 rank 数字；真正通信走 `get_*_group()` 与 `runtime_context.get_parallel()`。
+Scheduler 侧 `ParallelState` dataclass（定义在 `distributed/parallel_state_wrapper.py`，不是 `parallel_state.py`）只存 rank 数字；真正通信走 `parallel_state.get_*_group()` 与 `runtime_context.get_parallel()`。
 
 DP-attention：`layers/dp_attention.py` 的 `compute_dp_attention_world_info` / `initialize_dp_attention`；注意力在 DP 维分数据，MLP 仍可能跨 DP 同步（可用 `speculative_skip_dp_mlp_sync` 等开关）。
 

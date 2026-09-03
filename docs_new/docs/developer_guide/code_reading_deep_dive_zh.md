@@ -123,7 +123,7 @@ Hybrid：`SWATokenToKVPoolAllocator`、`MambaSlotAllocator`、`HiSparseTokenToKV
 
 - `MHATokenToKVPool`：经典 MHA/GQA，`k_buffer`/`v_buffer` 按层。
 - `MLATokenToKVPool` / `DSATokenToKVPool`：MLA / DeepSeek sparse（V3.2 DSA）。
-- `DeepSeekV4TokenToKVPool`：V4 SWA+C4+C128+indexer（详见 [DeepSeek-V4 专题](./code_reading_deepseek_v4_zh.md)）。
+- `DeepSeekV4TokenToKVPool`（`mem_cache/deepseek_v4_memory_pool.py`，不在 `memory_pool.py`）：V4 SWA+C4+C128+indexer（详见 [DeepSeek-V4 专题](./code_reading_deepseek_v4_zh.md)）。
 - `HybridLinearKVPool`：full attention + linear/SSM。
 - FP4 / MXFP8 / PageMajor 变体：dtype 与布局特化。
 
@@ -141,10 +141,13 @@ Hybrid：`SWATokenToKVPoolAllocator`、`MambaSlotAllocator`、`HiSparseTokenToKV
 ```text
 disable_radix + chunked → ChunkCache / SWAChunkCache
 SGLANG_EXPERIMENTAL_CPP_RADIX_TREE → RadixCacheCpp
-SGLANG_ENABLE_UNIFIED_RADIX_TREE | MLX | hybrid SWA/SSM → UnifiedRadixCache
+SGLANG_ENABLE_UNIFIED_RADIX_TREE | MLX → UnifiedRadixCache
+hybrid SWA 且 full_tokens_per_layer==0 → PureSWARadixCache
+其余 hybrid SWA/SSM → UnifiedRadixCache
 enable_hierarchical_cache → HiRadixCache（纯 KV）或 Unified+init_hicache
-enable_lmcache / enable_flexkv → 对应包装
+enable_lmcache / enable_flexkv → 对应子类（非薄包装）
 else → RadixCache
+（create 之后可再包一层 StreamingSession）
 ```
 
 `--radix-cache-backend <name>` 走 `register_radix_cache_backend` 的插件工厂。
@@ -391,7 +394,7 @@ PP：`PPMissingLayer` 占位非本 rank 的 embed/norm。
 
 `msgspec.Struct`，跨进程 msgpack 友好。字段分 API（`temperature`、`top_p`、`top_k`、`min_p`、penalties、`json_schema`/`regex`/`ebnf`、`logit_bias`、`custom_params`…）与 `normalize()` 后内部字段（`stop_strs`、`stop_str_max_len`…）。
 
-`TOP_K_ALL = 1<<30` 表示“不限制 top-k”。`temperature≈0` 在 verify 时按 greedy 处理。
+`TOP_K_ALL = 1<<30` 表示“不限制 top-k”。`temperature≈0` 在 **`normalize()`**（不是 `verify()`）里折成 greedy（`top_k=1`）。
 
 ### 4.2 `SamplingBatchInfo`
 
@@ -422,14 +425,14 @@ HTTP SamplingParams
   → Req.sampling_params
   → ScheduleBatch → SamplingBatchInfo.from_schedule_batch
   → ModelRunner 得到 logits
-  → penalties / grammar mask / custom processor / bias
+  → penalties → grammar mask → logit_bias → custom processor
   → softmax+topk/topp 或 greedy → next token ids
 ```
 
 **不变量：**
 
 - `custom_params` 必须 JSON 可序列化；`Req` 注入的 `__req__` 只活在 scheduler 进程内。
-- Grammar / constrained 与 penalty 顺序固定：先 penalty/bias，再 mask，再 sample（以当前 sampler 实现为准，改时保持批内一致）。
+- Logits 改写顺序（当前实现）：**penalty → grammar mask → logit_bias → custom processor → sample**。改采样路径时保持批内一致，不要假设 bias 一定在 mask 之前。
 - Deterministic 模式依赖 `sampling_seed` 张量；与 radix `disable_finished_insert` 等开关联动。
 
 **常见修改点：** 新惩罚 → 新 `BatchedPenalizer` 并挂到 orchestrator；新约束 → grammar backend；自定义 logits → `CustomLogitProcessor` + server 开关。

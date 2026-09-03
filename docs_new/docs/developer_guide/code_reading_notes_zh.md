@@ -56,7 +56,7 @@ keywords:
 
 ## 心智模型（读第 1 篇前先记住）
 
-1. **三进程**：主进程 tokenize + HTTP；每 GPU rank 一个 Scheduler 做 forward；Detokenizer 独立进程。
+1. **进程角色（不是永远只有三个进程）**：主进程 tokenize + HTTP；**本机每个 GPU rank 一个 Scheduler 子进程**做 forward（`tp=8` 就是 8 个，不是 1 个）；Detokenizer 独立进程。另可能有 DP controller、tokenizer/detokenizer router、weight-cache daemon。只有 **attn-TP rank 0** 的 Scheduler 收 ZMQ，再广播给同组其他 rank。
 2. **IPC**：ZMQ + `managers/io_struct.py`（msgspec）；大多模态可走 shm。
 3. **RadixAttention / RadixCache**：前缀共享 KV；模型里用 `RadixAttention` 而不是裸 Attention。
 4. **配置**：`ServerArgs` 是种子；业务读 `RuntimeContext` namespace bags；环境变量进 `environ.Envs`。
@@ -139,5 +139,18 @@ python3 -m sglang.launch_server --model-path MODEL --tp 16 \
 | `AttentionBackend` / `@register_attention_backend` | `layers/attention/{base_attn_backend,attention_registry}.py` | 6 |
 | `SRTPlatform` / `load_plugins` | `platforms/interface.py`、`plugins/__init__.py` | 6 |
 | `NpuCommunicator` / `BaseFusedOp` | `distributed/device_communicators/npu_communicator.py`、`kernels/fused_op.py` | 6 |
+
+## 能力边界（读前先看）
+
+这套文档是 **实现级地图 + 关键路径精读**，不是「读完即可精通整个仓库」的教程。
+
+| 读完后你能做到 | 单靠文档做不到 |
+|---|---|
+| 画出 HTTP→Scheduler→ModelRunner 主路径，并打开对应文件 | 不对照源码、不跑通一个模型，无法形成肌肉记忆 |
+| 改调度/缓存/加模型时知道先动哪几个类 | 精通每一个 attention backend、每一种量化、每条 PD/EP 生产路径 |
+| 按 NPU 样板规划第三方 device 的 `dsv4` 分流 | 在新芯片上一次调通数值与吞吐（必须写 kernel + 对齐测试） |
+| 跟一条 DeepSeek-V4 请求的压缩注意力与 KV 布局 | 背下所有 `SGLANG_*` 与所有模型变体 |
+
+建议配合成长：官方 Install + 本机起一个小模型 → 第 1–2 篇对着源码跟 rid → 做一道 unit/e2e → 再按任务读 3–6 篇或 V4 专题。行号会随 `main` 漂移，以符号名为准。
 
 下一篇请直接打开：[SRT 核心服务路径精读](./code_reading_srt_core_zh.md)。

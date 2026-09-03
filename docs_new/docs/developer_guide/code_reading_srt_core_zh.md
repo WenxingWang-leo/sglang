@@ -14,7 +14,7 @@ keywords:
 
 系列导航：[总目录](./code_reading_notes_zh.md) · [第 2 篇 Cache/Models](./code_reading_deep_dive_zh.md) · [第 3 篇进阶](./code_reading_notes_advanced_zh.md) · [第 4 篇服务扩展](./code_reading_serving_extensions_zh.md) · [第 5 篇生态](./code_reading_ecosystem_zh.md)
 
-## 0. 总览：一条请求怎么穿过三个进程
+## 0. 总览：一条请求怎么穿过三类进程
 
 ```text
 Client HTTP / Engine.generate
@@ -51,9 +51,11 @@ Client HTTP / Engine.generate
 
 设计要点：
 
-1. **主进程不做 GPU forward**；GPU 独占在 Scheduler 子进程。
-2. IPC 载荷定义在 `python/sglang/srt/managers/io_struct.py`，默认 **msgspec msgpack**（`msgpack_encode` / `sock_send`）；多模态等不透明字段用 `PickleWrapper`。
-3. HTTP 与 Python `Engine` API **共用** `_launch_subprocesses` + `TokenizerManager.generate_request`；差异只在入口层。
+1. **主进程不做 GPU forward**；GPU 独占在 Scheduler 子进程。图上画的是**三类角色**，不是永远 3 个 OS 进程：`tp=N` 本机就有 N 个 Scheduler；还可有 DP controller、multi-tokenizer/detokenizer router、weight-cache daemon。
+2. **只有 attn-TP/PP rank 0 的 Scheduler 绑 ZMQ**；同组其他 rank 靠 `SchedulerRequestReceiver` 广播，不是每人一条 `ipc://`。
+3. IPC 载荷定义在 `python/sglang/srt/managers/io_struct.py`，默认 **msgspec msgpack**（`msgpack_encode` / `sock_send`）；多模态等不透明字段用 `PickleWrapper`。
+4. HTTP 与 Python `Engine` API **共用** `_launch_subprocesses` + `TokenizerManager.generate_request`；差异只在入口层。
+5. `dispatch_event_loop` 不只 normal/overlap：还有 `event_loop_pp`、`event_loop_pdmux`、`event_loop_overlap_mlx`、PD prefill/decode 变体。`SGLANG_RUST_SERVER` 时 detokenize 不走 Python Detokenizer。
 
 ---
 
