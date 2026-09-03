@@ -438,7 +438,7 @@ init_output_streamer / batch_result_processor
 ...
 ```
 
-`enable_overlap = not disable_overlap_schedule`（非 MLX）。Overlap 时 CPU 调度与 GPU forward 用不同 CUDA stream（`schedule_stream` vs `forward_stream`），靠 WAR barrier / future_map 同步。
+`enable_overlap = not disable_overlap_schedule and not use_mlx()`；MLX 另走 `enable_overlap_mlx` + `event_loop_overlap_mlx`。Overlap 时 CPU 调度与 GPU forward 用不同 CUDA stream（`schedule_stream` vs `forward_stream`），靠 WAR barrier / future_map 同步。
 
 ### 4.2 Event loop：`normal` vs `overlap`
 
