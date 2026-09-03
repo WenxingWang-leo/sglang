@@ -23,6 +23,7 @@ keywords:
 | **5** | [生态组件](./code_reading_ecosystem_zh.md) | Frontend Language（`lang/`）/ sgl-model-gateway / multimodal_gen（Diffusion）/ Test·CI | 能区分 DSL vs SRT、网关路由、扩散运行时、加 CI 测试 |
 | **6** | [第三方硬件接入（DeepSeek-V4 / MoE+MLA）](./code_reading_hardware_device_zh.md) | `hardware_backend/`、attention 注册、Quant/MoE、`BaseFusedOp`、communicators、platform plugins、NPU/XPU 样板、DSV4 设备需求、`mydevice` 清单 | 能把新设备接到 MLA/DSA/DSV4 与 EP |
 | **专题** | [DeepSeek-V4 实现精读](./code_reading_deepseek_v4_zh.md) | `deepseek_v4*.py` / dsv4 backend / `DeepSeekV4TokenToKVPool` / mHC·Indexer·Compressor / MoE·EP / NextN·DSpark / NPU·HIP 钩子 / CLI | 能跟一条 V4 请求从 Scheduler 到 sample，并改压缩注意力或设备后端 |
+| **精通路线** | [已有模型/设备适配经验](./code_reading_mastery_infra_zh.md) | 控制面、调度、Radix 契约、投机/PD、配置纪律；P0–P2 自检 | 从「设备专家」补到「能改 SRT 内核」 |
 
 官方配套（操作手册，非精读）：[Install](/docs/get-started/install)、[Contribution Guide](/docs/developer_guide/contribution_guide)、[Support New Models](/docs/supported-models/support_new_models)、[Server Arguments](/docs/advanced_features/server_arguments)、[Cookbook · DeepSeek-V4](/cookbook/autoregressive/DeepSeek/DeepSeek-V4)。
 
@@ -79,6 +80,10 @@ python3 -m sglang.launch_server --model-path MODEL --tp 16 \
 关键 CLI 字段：`--model-path`、`--tp`/`--pp`/`--dp`/`--ep`、`--mem-fraction-static`、`--attention-backend`、`--quantization`、`--speculative-algorithm`、`--enable-lora`、`--disaggregation-mode`。完整列表见 `srt/server_args.py` 与 [Server Arguments](/docs/advanced_features/server_arguments)。
 
 ## 学习路线
+
+### 路线 H：已在第三方设备上适配过模型（infra 工程师精通）
+
+不要从第 6 篇硬件接入再读。走 **[精通路线](./code_reading_mastery_infra_zh.md)**：阶段 A 控制面 → B 调度 → C Radix 契约 → D 投机/PD → E 配置与 upstream。第 1–4 篇当源码索引，用文内 P0/P1 自检收口。
 
 ### 路线 A：只想部署运维
 
